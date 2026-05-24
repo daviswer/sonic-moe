@@ -697,6 +697,7 @@ class _MoeEPFunction(torch.autograd.Function):
             A_idx=a_idx_for_dout,
             batch_idx_permute=None,
             dynamic_scheduler=False,
+            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
         )
         del dout_dispatched, dout_for_kernel, a_prime, h, topk_scores_global
 
@@ -778,6 +779,7 @@ class _MoeEPFunction(torch.autograd.Function):
             batch_idx_permute=None,
             dynamic_scheduler=False,
             concat_layout=(("out",) if concat_layout else None),
+            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
         )
 
         ep_ws.o_hdl.barrier()
@@ -830,6 +832,7 @@ def _build_consumer_metadata(
     expert_frequency_offset = expert_frequency_offset[: E_local + 1]
 
     return {
+        "expert_frequency": expert_frequency,
         "expert_frequency_offset": expert_frequency_offset,
         "s_reverse_local": s_reverse_local,
         "x_gather_idx": x_gather_idx,
@@ -964,7 +967,7 @@ def _moe_ep_forward_inner(
         redispatch_x_in_backward,
         CPU_sync_on_runtime,
         ep_ws,
-    )
+    ), metadata["expert_frequency"]
 
 
 def _default_ep_config(W: int, K: int) -> RuntimeEPConfig:
@@ -1046,7 +1049,7 @@ def moe_ep_TC_softmax_topk_forward(
     ep_config: Optional[RuntimeEPConfig] = None,
     redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """EP forward with TC softmax-topk router.
 
     Uses :class:`EP_Router_Replicated_Across_Ranks` for the router projection so the backward
@@ -1110,7 +1113,7 @@ def moe_ep_TC_softmax_topk_forward(
     topk_idx_g = _ag_routing_decision(ws, topk_idx_l)
     ws.x_hdl.barrier()
 
-    return _moe_ep_forward_inner(
+    out, expert_frequency = _moe_ep_forward_inner(
         x_local=x,
         topk_idx_global=topk_idx_g,
         topk_scores_local=topk_scores_l,
@@ -1126,6 +1129,7 @@ def moe_ep_TC_softmax_topk_forward(
         redispatch_x_in_backward=redispatch_x_in_backward,
         CPU_sync_on_runtime=CPU_sync_on_runtime,
     )
+    return out, router_logits, expert_frequency[:-1]  # drop sentinel count
 
 
 def moe_ep_general_routing_forward(

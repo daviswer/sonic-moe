@@ -192,6 +192,7 @@ class _UpProjection(torch.autograd.Function):
             batch_idx_permute=None,
             dynamic_scheduler=False,
             concat_layout=(("out",) if concat_layout else None),
+            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
         )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
@@ -317,6 +318,7 @@ class _DownProjection(torch.autograd.Function):
             A_idx=x_gather_idx,
             batch_idx_permute=None,
             dynamic_scheduler=False,
+            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
         )
 
         # TC top-K routing
