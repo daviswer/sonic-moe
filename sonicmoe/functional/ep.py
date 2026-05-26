@@ -786,12 +786,13 @@ class _MoeEPFunction(torch.autograd.Function):
 
         ctx.ep_ws = None
 
+        # Default impl returns grads off by a factor of W compared to non-EP
         return (
             dx_local,
-            dw1,
-            db1,
-            dw2,
-            db2,
+            dw1/W,
+            db1/W if db1 is not None else None,
+            dw2/W,
+            db2/W if db2 is not None else None,
             ds_local,
             *([None] * 8),
         )
@@ -1049,6 +1050,7 @@ def moe_ep_TC_softmax_topk_forward(
     ep_config: Optional[RuntimeEPConfig] = None,
     redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
+    layer_id: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """EP forward with TC softmax-topk router.
 
@@ -1056,9 +1058,10 @@ def moe_ep_TC_softmax_topk_forward(
     automatically all-reduces ``drouter_w`` across the EP group — each
     rank's ``router_w`` accumulates the global-batch gradient.
 
-    The symm-mem workspace is cached per ``(group, x.device)`` inside
-    the module — see :func:`clear_ep_cache` for explicit cleanup. Pass
-    ``group=`` to target an EP group other than ``dist.group.WORLD``.
+    The symm-mem workspace is cached per ``(group, x.device, layer_id)`` to avoid buffer
+    sharing across layers during training (which breaks gradient computation). Pass
+    ``layer_id`` to distinguish each layer in a multi-layer network. See :func:`clear_ep_cache`
+    for explicit cleanup. Pass ``group=`` to target an EP group other than ``dist.group.WORLD``.
 
     ``ep_config`` selects the dispatch + combine primitives. When
     ``None`` (default), one is built via :func:`_default_ep_config` from
@@ -1099,10 +1102,14 @@ def moe_ep_TC_softmax_topk_forward(
         MAX_ROWS_PER_RANK_STATIC=T_local * W * min(K, E_local),
     )
 
-    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode)
+    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
 
     # Router projection with EP-aware drouter_w all-reduce.
-    router_logits = EP_Router_Replicated_Across_Ranks.apply(x, router_w, ws.ep_group)
+    # router_logits = EP_Router_Replicated_Across_Ranks.apply(x, router_w, ws.ep_group)
+
+    # Skip drouter_w all-reduce because fsdp is handling that for us
+    router_logits = F.linear(x, router_w)
+    
     topk_scores_l, topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
         router_logits, W * E_local, K, is_softmax_over_topk, norm_topk_probs
     )
@@ -1149,6 +1156,7 @@ def moe_ep_general_routing_forward(
     ep_config: Optional[RuntimeEPConfig] = None,
     redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
+    layer_id: Optional[int] = None,
 ) -> torch.Tensor:
     """EP forward with caller-supplied top-K routing.
 
@@ -1186,7 +1194,7 @@ def moe_ep_general_routing_forward(
         MAX_ROWS_PER_RANK_STATIC=T_local * W * min(K, E_local),
     )
 
-    ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode)
+    ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
     ep_ws.x_symm.copy_(x)
 
     topk_idx_g = _ag_routing_decision(ep_ws, topk_indices.to(torch.int32))

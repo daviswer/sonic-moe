@@ -430,8 +430,9 @@ class SymmMemManager:
         E_local: int,
         dtype: torch.dtype,
         mode: str,
+        layer_id: Optional[int] = None,
     ) -> _EPWorkspace:
-        key = (T_local, d, K, E_local, str(dtype), mode)
+        key = (T_local, d, K, E_local, str(dtype), mode, layer_id)
         ws = self._cache.get(key)
         if ws is None:
             ws = self._alloc_workspace(T_local, d, K, E_local, dtype, mode)
