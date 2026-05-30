@@ -170,6 +170,10 @@ class _EPWorkspace:
     # None otherwise.
     x_idx_expanded_remap_for_rank_dedup_buf: Optional[torch.Tensor] = None
 
+    # False for layer workspaces that share x_symm/y_symm with a base
+    # workspace.  release() uses this to skip freeing shared buffers.
+    _owns_heavy_buffers: bool = True
+
     @property
     def T_local(self) -> int:
         return self._T_local
@@ -236,40 +240,78 @@ class _EPWorkspace:
         After this returns no field pins GPU memory; calling forward on
         a released workspace is undefined.
 
-        Destruction order matters: peer_bufs are per-rank torch.Tensor
-        aliases of the local symm allocation, so they must drop BEFORE
-        the symm tensor itself. Otherwise the SymmetricMemory backing
-        the symm tensor can be torn down while peer aliases still
-        hold an AllocationRef into it; their later destructor calls
-        cuMemUnmap on freed pages and ``~AllocationRef`` throws
-        ``CUDA driver error: invalid argument`` (which is noexcept-
-        false ⇒ ``std::terminate`` ⇒ SIGABRT).
+        Destruction order matters for symm-mem: peer_bufs are per-rank
+        torch.Tensor aliases of the local symm allocation, so they must
+        drop BEFORE the symm tensor itself, and handles must drop before
+        the tensor. Otherwise the SymmetricMemory backing the symm tensor
+        can be torn down while peer aliases still hold an AllocationRef
+        into it; their later destructor calls cuMemUnmap on freed pages
+        and ``~AllocationRef`` throws ``CUDA driver error: invalid
+        argument`` (which is noexcept-false ⇒ ``std::terminate`` ⇒
+        SIGABRT).
+
+        For layer workspaces (``_owns_heavy_buffers=False``) x_symm /
+        y_symm and their associated handles and peer_bufs are shared with
+        the base workspace and must not be freed here — just null the
+        refs.  The ordering invariant is still maintained for the
+        per-layer symm-mem fields (s_rev, lazy do_symm /
+        partial_combine_buf) that the layer workspace owns outright.
         """
-        self.x_peer_bufs = ()
-        self.do_peer_bufs = ()
-        self.y_peer_bufs = ()
-        self.s_rev_peer_bufs = ()
-        self.partial_combine_peer_bufs = ()
-        # Each *_hdl is the SymmetricMemory wrapper for its buffer
-        # If it survives past the symm tensor below it would keep an internal AllocationRef
-        # alive and we'd hit the same cuMemUnmap("invalid argument") crash one rendezvous later.
-        self.x_hdl = None
-        self.do_hdl = None
-        self.o_hdl = None
-        self.s_rev_hdl = None
-        self.partial_combine_hdl = None
-        # ↓ now the symm-mem buffers themselves.
-        self.x_symm = None
-        self.do_symm = None
-        self.y_symm = None
-        self.s_rev_symm = None
-        self.partial_combine_buf = None
-        # Plain HBM (not symm-mem) — order doesn't matter.
-        self.a2a_recv = None
-        self.ag_compute = None
-        self.t_global_pattern = None
-        self._ag_redispatch_buf = None
-        self.x_idx_expanded_remap_for_rank_dedup_buf = None
+        if self._owns_heavy_buffers:
+            # Full release — peer aliases → handles → tensors.
+            self.x_peer_bufs = ()
+            self.do_peer_bufs = ()
+            self.y_peer_bufs = ()
+            self.s_rev_peer_bufs = ()
+            self.partial_combine_peer_bufs = ()
+            self.x_hdl = None
+            self.do_hdl = None
+            self.o_hdl = None
+            self.s_rev_hdl = None
+            self.partial_combine_hdl = None
+            self.x_symm = None
+            self.do_symm = None
+            self.y_symm = None
+            self.s_rev_symm = None
+            self.partial_combine_buf = None
+            self.a2a_recv = None
+            self.ag_compute = None
+            self.t_global_pattern = None
+            self._ag_redispatch_buf = None
+            self.x_idx_expanded_remap_for_rank_dedup_buf = None
+        else:
+            # Layer-only release.  Drop refs to shared (base-owned)
+            # buffers without freeing; release per-layer symm-mem in
+            # proper order.
+
+            # Shared — just null refs (base still holds the live refs).
+            self.x_peer_bufs = ()
+            self.y_peer_bufs = ()
+            self.x_hdl = None
+            self.o_hdl = None
+            self.x_symm = None
+            self.y_symm = None
+            self.a2a_recv = None
+            self.ag_compute = None
+            self.t_global_pattern = None
+
+            # Per-layer lazy symm-mem (do_symm, partial_combine_buf) —
+            # may or may not have been allocated; release in order.
+            self.do_peer_bufs = ()
+            self.do_hdl = None
+            self.do_symm = None
+            self.partial_combine_peer_bufs = ()
+            self.partial_combine_hdl = None
+            self.partial_combine_buf = None
+
+            # Per-layer core symm-mem — release in order.
+            self.s_rev_peer_bufs = ()
+            self.s_rev_hdl = None
+            self.s_rev_symm = None
+
+            # Per-layer plain HBM.
+            self._ag_redispatch_buf = None
+            self.x_idx_expanded_remap_for_rank_dedup_buf = None
 
 
 # ============================================================================
@@ -422,6 +464,67 @@ class SymmMemManager:
             x_idx_expanded_remap_for_rank_dedup_buf=x_idx_expanded_remap_for_rank_dedup_buf,
         )
 
+    def _alloc_layer_workspace(
+        self,
+        base: _EPWorkspace,
+        T_local: int,
+        d: int,
+        K: int,
+        E_local: int,
+        dtype: torch.dtype,
+        mode: str,
+    ) -> _EPWorkspace:
+        """Create a per-layer workspace that shares heavy buffers with *base*.
+
+        x_symm, y_symm and all scratch buffers are borrowed from *base*
+        (their content is always overwritten before each use, so sharing
+        across layers is safe).  Only s_rev_symm and
+        x_idx_expanded_remap_for_rank_dedup_buf get fresh allocations,
+        because they carry routing metadata that must survive from each
+        layer's forward through to its backward.
+        """
+        W = self.world_size
+        TK_global = W * T_local * K
+        MAX_ROWS_PER_RANK = T_local * W * min(K, E_local)
+
+        s_rev_symm, s_rev_hdl, s_rev_peer_bufs = self._alloc_symm((TK_global,), torch.int32)
+
+        x_idx_expanded_remap_for_rank_dedup_buf = None
+        if _is_rank_dedup_dispatch_mode(mode):
+            x_idx_expanded_remap_for_rank_dedup_buf = torch.empty(
+                MAX_ROWS_PER_RANK, dtype=torch.int32, device=self.device
+            )
+
+        return _EPWorkspace(
+            # Heavy buffers shared from base.
+            x_symm=base.x_symm,
+            x_hdl=base.x_hdl,
+            x_peer_bufs=base.x_peer_bufs,
+            y_symm=base.y_symm,
+            o_hdl=base.o_hdl,
+            y_peer_bufs=base.y_peer_bufs,
+            # Per-layer routing symm-mem.
+            s_rev_symm=s_rev_symm,
+            s_rev_hdl=s_rev_hdl,
+            s_rev_peer_bufs=s_rev_peer_bufs,
+            # Scalar metadata from base.
+            ep_group=base.ep_group,
+            world_size=base.world_size,
+            my_rank=base.my_rank,
+            E_local=base.E_local,
+            _T_local=base._T_local,
+            _K=base._K,
+            _d=base._d,
+            dispatch_mode=base.dispatch_mode,
+            # Scratch buffers shared from base.
+            a2a_recv=base.a2a_recv,
+            ag_compute=base.ag_compute,
+            t_global_pattern=base.t_global_pattern,
+            # Per-layer A_idx buffer (RANK_DEDUP only).
+            x_idx_expanded_remap_for_rank_dedup_buf=x_idx_expanded_remap_for_rank_dedup_buf,
+            _owns_heavy_buffers=False,
+        )
+
     def _get_or_alloc(
         self,
         T_local: int,
@@ -435,7 +538,11 @@ class SymmMemManager:
         key = (T_local, d, K, E_local, str(dtype), mode, layer_id)
         ws = self._cache.get(key)
         if ws is None:
-            ws = self._alloc_workspace(T_local, d, K, E_local, dtype, mode)
+            if layer_id is None:
+                ws = self._alloc_workspace(T_local, d, K, E_local, dtype, mode)
+            else:
+                base = self._get_or_alloc(T_local, d, K, E_local, dtype, mode, layer_id=None)
+                ws = self._alloc_layer_workspace(base, T_local, d, K, E_local, dtype, mode)
             self._cache[key] = ws
         return ws
 
