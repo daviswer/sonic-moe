@@ -73,6 +73,16 @@ from .distributed import (
 )
 from .metadata import general_routing_router_metadata_triton
 
+# Symm mem doesn't play nicely with torch.compile, so we pre-compile
+# the subfunctions that we are able to:
+def _router_forward(x, router_w, E, K, is_softmax_over_topk, norm_topk_probs):
+    router_logits = F.linear(x, router_w)
+    topk_scores_l, topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
+        router_logits, E, K, is_softmax_over_topk, norm_topk_probs
+    )
+    return topk_scores_l, topk_idx_l, router_logits
+_compiled_router_forward = torch.compile(_router_forward)
+_compiled_dispatch_metadata = torch.compile(compute_dispatch_metadata)
 
 __all__ = [
     "CombineMode",
@@ -334,7 +344,12 @@ class _MoeEPFunction(torch.autograd.Function):
         # otherwise the structural ceiling.
         max_rows_per_rank_runtime = MAX_ROWS_PER_RANK_STATIC
         if CPU_sync_on_runtime:
-            max_rows_per_rank_runtime = expert_frequency_offset[E_local].item()
+            actual = expert_frequency_offset[E_local].item()
+            # Round up to the next power of two so Triton/QuACK autotune
+            # keys stay within O(log W) distinct values rather than varying
+            # every step and thrashing the cache.
+            binned = 1 << max(actual - 1, 0).bit_length()
+            max_rows_per_rank_runtime = min(binned, MAX_ROWS_PER_RANK_STATIC)
 
         # ====================================================================
         # 1. Dispatch x → x_compute
@@ -443,6 +458,11 @@ class _MoeEPFunction(torch.autograd.Function):
             concat_layout=((("B", "bias") if b1 is not None else ("B",)) if concat_layout else None),
         )
 
+        # gemm_gated only writes h[0:actual] via seqlens; zero the power-of-2
+        # padding tail so gemm_dgated in backward doesn't read garbage.
+        if CPU_sync_on_runtime and max_rows_per_rank_runtime > actual:
+            h[actual:].zero_()
+
         # ====================================================================
         # 3. Down-proj GEMM: a @ w2 → y_symm
         # ====================================================================
@@ -503,6 +523,9 @@ class _MoeEPFunction(torch.autograd.Function):
             ctx.redispatch_x_in_backward = redispatch_x_in_backward
             ctx.CPU_sync_on_runtime = CPU_sync_on_runtime
             ctx.max_rows_per_rank_runtime = max_rows_per_rank_runtime
+            # actual_rows == max_rows when there is no power-of-2 padding;
+            # sentinel mask in backward can be skipped only in that case.
+            ctx.actual_rows = actual if CPU_sync_on_runtime else max_rows_per_rank_runtime
             ctx.ep_ws = ep_ws
             # Cached AG of topk_scores from the RS- or RANK_DEDUP-combine
             # forward path; backward step 3 reuses this when present
@@ -658,15 +681,16 @@ class _MoeEPFunction(torch.autograd.Function):
             a_idx_for_dout = x_gather_idx[:max_rows_per_rank_runtime]
             dout_for_kernel = dout_dispatched
         s_scatter_idx_local = s_scatter_idx[:max_rows_per_rank_runtime]
-        # ds-scatter sentinel mask: only needed when the iteration
-        # range can include sentinel slots — i.e., when
-        # max_rows_per_rank_runtime > real_total. Under
-        # ``CPU_sync_on_runtime`` we synced runtime down to
-        # real_total, so s_scatter_idx_local contains only local-
-        # routed slots and the mask is dead weight in the kernel.
-        # Pass dst_rank_flat=None there to skip the per-slot
-        # ``tl.load(dst_rank_flat[slot])`` and the conditional write.
-        dst_rank_flat_for_scatter = None if cpu_synced else dst_rank_flat
+        # ds-scatter sentinel mask: needed whenever s_scatter_idx_local
+        # may contain sentinel slots (rows routed to other ranks).
+        # Under CPU_sync_on_runtime with no power-of-2 padding
+        # (max_rows == actual_rows), s_scatter_idx_local contains only
+        # locally-routed slots so the mask is dead weight — skip it.
+        # When binning rounds up past actual_rows, positions
+        # [actual_rows:max_rows] are sentinel slots; passing dst_rank_flat
+        # lets _scatter_ds correctly ignore them.
+        no_padding = cpu_synced and (max_rows_per_rank_runtime == ctx.actual_rows)
+        dst_rank_flat_for_scatter = None if no_padding else dst_rank_flat
         _down_projection_backward_act(
             dout=dout_for_kernel,
             h=h,
@@ -785,6 +809,8 @@ class _MoeEPFunction(torch.autograd.Function):
         ep_ws.o_hdl.barrier()
 
         ctx.ep_ws = None
+        ctx.meta = None
+        ctx.scores_global = None
 
         # Default impl returns grads off by a factor of W compared to non-EP
         return (
@@ -863,7 +889,7 @@ def _moe_ep_forward_inner(
     dispatch_mode = cfg.dispatch_mode
     combine_mode = cfg.combine_mode
 
-    meta = compute_dispatch_metadata(topk_idx_global, my_rank=my_rank, E_local=E_local)
+    meta = _compiled_dispatch_metadata(topk_idx_global, my_rank=my_rank, E_local=E_local)
     dst_rank_flat = meta["dst_rank_flat"]
     my_dst_rank = meta["my_dst_rank"]
     expert_local_padded = meta["expert_local_padded"]
@@ -1031,6 +1057,7 @@ def _ag_routing_decision(
     return out.view(W, T_local, K)
 
 
+@torch._dynamo.disable
 def moe_ep_TC_softmax_topk_forward(
     x: torch.Tensor,
     router_w: torch.Tensor,
@@ -1108,10 +1135,8 @@ def moe_ep_TC_softmax_topk_forward(
     # router_logits = EP_Router_Replicated_Across_Ranks.apply(x, router_w, ws.ep_group)
 
     # Skip drouter_w all-reduce because fsdp is handling that for us
-    router_logits = F.linear(x, router_w)
-    
-    topk_scores_l, topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
-        router_logits, W * E_local, K, is_softmax_over_topk, norm_topk_probs
+    topk_scores_l, topk_idx_l, router_logits = _compiled_router_forward(
+        x, router_w, W * E_local, K, is_softmax_over_topk, norm_topk_probs
     )
 
     # Publish x to peers (forward x dispatch in _moe_ep_forward_inner

@@ -295,14 +295,17 @@ class _EPWorkspace:
             self.ag_compute = None
             self.t_global_pattern = None
 
-            # Per-layer lazy symm-mem (do_symm, partial_combine_buf) —
+            # partial_combine_buf is shared from base — null the refs
+            # without freeing (base owns and will release it).
+            self.partial_combine_peer_bufs = ()
+            self.partial_combine_hdl = None
+            self.partial_combine_buf = None
+
+            # Per-layer lazy symm-mem (do_symm only now) —
             # may or may not have been allocated; release in order.
             self.do_peer_bufs = ()
             self.do_hdl = None
             self.do_symm = None
-            self.partial_combine_peer_bufs = ()
-            self.partial_combine_hdl = None
-            self.partial_combine_buf = None
 
             # Per-layer core symm-mem — release in order.
             self.s_rev_peer_bufs = ()
@@ -421,6 +424,14 @@ class SymmMemManager:
         # x_symm can stay live for the X redispatch in step 2).
         y_symm, o_hdl, y_peer_bufs = self._alloc_symm((MAX_ROWS_PER_RANK, d), dtype)
         s_rev_symm, s_rev_hdl, s_rev_peer_bufs = self._alloc_symm((TK_global,), torch.int32)
+        # partial_combine_buf is pre-allocated on the base so all layer
+        # workspaces can share a single (W*T_local, d) symm buffer rather
+        # than each lazily allocating their own.  28 layers × 320 MB = 8.9 GB
+        # otherwise.  A2A_COMBINE never writes here, wasting 320 MB in that
+        # case, but that is far cheaper than the per-layer lazy cost.
+        partial_combine_buf, partial_combine_hdl, partial_combine_peer_bufs = self._alloc_symm(
+            (W * T_local, d), dtype
+        )
 
         a2a_recv = None
         ag_compute = None
@@ -462,6 +473,9 @@ class SymmMemManager:
             ag_compute=ag_compute,
             t_global_pattern=t_global_pattern,
             x_idx_expanded_remap_for_rank_dedup_buf=x_idx_expanded_remap_for_rank_dedup_buf,
+            partial_combine_buf=partial_combine_buf,
+            partial_combine_hdl=partial_combine_hdl,
+            partial_combine_peer_bufs=partial_combine_peer_bufs,
         )
 
     def _alloc_layer_workspace(
@@ -522,6 +536,10 @@ class SymmMemManager:
             t_global_pattern=base.t_global_pattern,
             # Per-layer A_idx buffer (RANK_DEDUP only).
             x_idx_expanded_remap_for_rank_dedup_buf=x_idx_expanded_remap_for_rank_dedup_buf,
+            # partial_combine_buf shared from base — one allocation for all layers.
+            partial_combine_buf=base.partial_combine_buf,
+            partial_combine_hdl=base.partial_combine_hdl,
+            partial_combine_peer_bufs=base.partial_combine_peer_bufs,
             _owns_heavy_buffers=False,
         )
 
