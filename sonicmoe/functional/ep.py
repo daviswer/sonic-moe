@@ -35,12 +35,23 @@
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from quack.gemm_interface import gemm, gemm_gated
+
+# One-time guard for the comprehensive forward+backward kernel warmup
+# (warmup_ep_kernels): QuACK (CUTLASS-DSL) JIT-compiles each gemm kernel the first
+# time it sees a given token-count bucket (~2s on the CPU with the GPU idle).
+# Routing imbalance pushes the runtime row count into new buckets mid-training, so
+# without warmup each new bucket stalls one rank ~2s and the whole EP group waits
+# on it at the next collective. pow2 binning makes the bucket set finite, so we
+# pre-compile every forward AND backward gemm for the occurring buckets up front.
+_EP_WARMED = False
 
 from ..distributed_utils import (
     CombineMode,
@@ -176,24 +187,16 @@ def _do_dispatch(
         raise NotImplementedError()
 
 
-def _all_gather_topk_scores(
-    topk_scores_local: torch.Tensor,
-    group: dist.ProcessGroup,
-    W: int,
-    T_local: int,
-    K: int,
-) -> torch.Tensor:
-    scores_global = torch.empty(
-        W * T_local * K,
-        dtype=topk_scores_local.dtype,
-        device=topk_scores_local.device,
-    )
-    dist.all_gather_into_tensor(
-        scores_global,
-        topk_scores_local.view(-1).contiguous(),
-        group=group,
-    )
-    return scores_global
+# Cached high-priority stream per device for overlapping the NCCL score AG (fwd)
+# and ds reduce-scatter (bwd) with the expert GEMMs. The collective is bracketed
+# by wait_stream on both sides to avoid overlap/deadlock with symm-mem dispatch/combine
+_EP_COMM_STREAM: dict = {}
+def _ep_comm_stream(device) -> "torch.cuda.Stream":
+    s = _EP_COMM_STREAM.get(str(device))
+    if s is None:
+        s = torch.cuda.Stream(device=device, priority=-1)
+        _EP_COMM_STREAM[str(device)] = s
+    return s
 
 
 def _do_combine(
@@ -423,6 +426,27 @@ class _MoeEPFunction(torch.autograd.Function):
             )
 
         # ====================================================================
+        # 1b. Async score all-gather (NCCL)
+        # ====================================================================
+        # RS / RANK_DEDUP combine need the ep-group's gathered topk scores. Dispatch
+        # (symm-mem) is done and scores are ready, so issue the AG on the comm stream
+        # now: it overlaps the up/down GEMMs (pure compute) and is joined before the
+        # combine (symm-mem) at step 4.
+        scores_global: Optional[torch.Tensor] = None
+        _scores_comm: Optional["torch.cuda.Stream"] = None
+        if cfg.combine_mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
+            scores_global = torch.empty(
+                ep_ws.world_size * T_local * K, dtype=topk_scores_local.dtype, device=device
+            )
+            scores_in = topk_scores_local.reshape(-1).contiguous()
+            _scores_comm = _ep_comm_stream(device)
+            _scores_comm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(_scores_comm):
+                dist.all_gather_into_tensor(scores_global, scores_in, group=ep_ws.ep_group)
+            scores_global.record_stream(_scores_comm)
+            scores_in.record_stream(_scores_comm)
+
+        # ====================================================================
         # 2. Up-proj GEMM with fused gated activation: x_compute @ w1 → (h, a)
         # ====================================================================
         a = torch.empty(max_rows_per_rank_runtime, I, dtype=x_dtype, device=device)
@@ -483,9 +507,10 @@ class _MoeEPFunction(torch.autograd.Function):
         # 4. NVLink combine → o_local
         # ====================================================================
         # Mode-dispatched by ``_do_combine``; barrier placement is internal to each branch there.
-        scores_global: Optional[torch.Tensor] = None
-        if cfg.combine_mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
-            scores_global = _all_gather_topk_scores(topk_scores_local, ep_ws.ep_group, ep_ws.world_size, T_local, K)
+        # Join the score AG (issued on the comm stream at step 1b) before the combine
+        # so the symm-mem combine avoids deadlocking the NCCL collective.
+        if _scores_comm is not None:
+            torch.cuda.current_stream().wait_stream(_scores_comm)
         o_local = _do_combine(
             ep_ws,
             my_dst_rank=my_dst_rank,
@@ -710,6 +735,20 @@ class _MoeEPFunction(torch.autograd.Function):
         )
 
         # ====================================================================
+        # 5b. Async reduce-scatter ds -> ds_local (NCCL)
+        # ====================================================================
+        # ds is ready (down-proj backward) and ds_local is only consumed at return, so
+        # issue the RS on the comm stream now: it overlaps the dW2 + up-proj GEMMs
+        # (pure compute) and is joined before the combine (symm-mem) at step 8.
+        ds_local = torch.empty(T_local * K, dtype=ds.dtype, device=device)
+        _ds_comm = _ep_comm_stream(device)
+        _ds_comm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(_ds_comm):
+            dist.reduce_scatter_tensor(ds_local, ds, op=dist.ReduceOp.SUM, group=ep_ws.ep_group)
+        ds_local.record_stream(_ds_comm)
+        ds.record_stream(_ds_comm)
+
+        # ====================================================================
         # 5. dW2 GEMM
         # ====================================================================
         dw2 = torch.empty_like(w2)
@@ -724,18 +763,6 @@ class _MoeEPFunction(torch.autograd.Function):
             tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
         )
         del dout_dispatched, dout_for_kernel, a_prime, h, topk_scores_global
-
-        # ====================================================================
-        # 6. Reduce-scatter ds → ds_local
-        # ====================================================================
-        ds_local = torch.empty(T_local * K, dtype=ds.dtype, device=ds.device)
-        dist.reduce_scatter_tensor(
-            ds_local,
-            ds,
-            op=dist.ReduceOp.SUM,
-            group=ep_ws.ep_group,
-        )
-        ds_local = ds_local.view(T_local, K)
 
         # ====================================================================
         # 7. Up-proj backward act: dh → dx_expanded (in y_symm), db1
@@ -755,6 +782,10 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 8. Cross-rank combine of dx_expanded → dx_local
         # ====================================================================
+        # Join the ds reduce-scatter (issued on the comm stream at step 5b) before the
+        # combine (symm-mem) so the NCCL collective doesn't deadlock.
+        torch.cuda.current_stream().wait_stream(_ds_comm)
+        ds_local = ds_local.view(T_local, K)
         dx_local = _do_combine(
             ep_ws,
             my_dst_rank=my_dst_rank,
@@ -1058,6 +1089,129 @@ def _ag_routing_decision(
 
 
 @torch._dynamo.disable
+def warmup_ep_kernels(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    b1: Optional[torch.Tensor],
+    b2: Optional[torch.Tensor],
+    E: int,
+    K: int,
+    *,
+    group: Optional[dist.ProcessGroup],
+    layer_id: Optional[int],
+    activation_type: ActivationType = ActivationType.SWIGLU,
+    concat_layout: bool = False,
+    CPU_sync_on_runtime: bool = True,
+    ep_config: Optional["RuntimeEPConfig"] = None,
+) -> None:
+    """One-time: compile every forward AND backward QuACK gemm kernel for the token
+    buckets that occur at runtime, so no CUTLASS-DSL JIT (~2s, GPU idle) ever stalls
+    a rank mid-training.
+
+    Runs real forward+backward through :func:`moe_ep_general_routing_forward` (which
+    shares ``_MoeEPFunction`` with the TC-softmax path, so the kernels compiled here
+    are exactly the ones training reuses) with synthetic routing that drives
+    ``actual`` (rows landing on local experts) from balanced up to its max, cycled
+    across ep positions so every rank compiles every bucket. Uses detached weight
+    clones, so the warmup's backward never touches the real gradients. 
+    """
+    global _EP_WARMED
+    if _EP_WARMED:
+        return
+    _EP_WARMED = True
+    import logging
+
+    log = logging.getLogger("sonicmoe.warmup")
+    try:
+        W = dist.get_world_size(group) if group is not None else dist.get_world_size()
+        if W <= 0 or E % W != 0:
+            return
+        E_local = E // W
+        T_local, d = x.shape
+        dtype, device = x.dtype, x.device
+        # Detached clones so the warmup backward populates dummy grads, not real ones.
+        w1w = w1.detach().clone().requires_grad_(True)
+        w2w = w2.detach().clone().requires_grad_(True)
+        b1w = None if b1 is None else b1.detach().clone().requires_grad_(True)
+        b2w = None if b2 is None else b2.detach().clone().requires_grad_(True)
+        # Scores MUST be fp32 to match the TC-softmax router (functional/__init__.py
+        # allocates topk_router_score as float32).
+        ts = torch.ones(T_local, K, dtype=torch.float32, device=device)
+        can_local = E_local >= K
+
+        def _draw(n: int, base: int, span: int) -> torch.Tensor:
+            # n rows of K distinct expert ids drawn from [base, base+span).
+            return base + torch.argsort(torch.rand(n, span, device=device), dim=1)[:, :K].to(torch.long)
+
+        def _draw_skip(n: int, p: int) -> torch.Tensor:
+            # n rows of K distinct expert ids drawn from ALL blocks EXCEPT rank p's,
+            # so these tokens add nothing to p's incoming count.
+            idx = torch.argsort(torch.rand(n, E - E_local, device=device), dim=1)[:, :K]
+            idx = idx + (idx >= p * E_local).to(idx.dtype) * E_local  # skip p's block
+            return idx.to(torch.long)
+
+        def _routing(B: int, p: int) -> torch.Tensor:
+            # Drive TARGET rank p to ~B incoming rows (one pow2 bucket): each rank
+            # routes round(B/(W*K)) of its tokens (all K slots) to p's local experts,
+            # while ALL other tokens avoid p's block entirely. p's incoming count is
+            # then ~W*n_hot*K ~= B (not flooded to balanced), so sweeping B over every
+            # pow2 from a starved floor up to MAX lands the target on each bucket
+            # exactly. Cycling p over all W ranks makes every rank compile every
+            # bucket in-process (and writes each to the shared on-disk .o cache).
+            ti = _draw_skip(T_local, p)
+            if can_local:
+                n_hot = min(max(round(B / (W * K)), 1), T_local)
+                ti[:n_hot] = _draw(n_hot, p * E_local, E_local)
+            return ti
+
+        def _run(ti: torch.Tensor) -> None:
+            xw = torch.randn(T_local, d, dtype=dtype, device=device, requires_grad=True)
+            res = moe_ep_general_routing_forward(
+                xw,
+                ti,
+                ts,
+                w1w,
+                b1w,
+                w2w,
+                b2w,
+                E,
+                group=group,
+                activation_type=activation_type,
+                concat_layout=concat_layout,
+                redispatch_x_in_backward=False,
+                CPU_sync_on_runtime=CPU_sync_on_runtime,
+                layer_id=layer_id,
+                ep_config=ep_config,
+            )
+            out = res[0] if isinstance(res, (tuple, list)) else res
+            out.float().sum().backward()
+
+        npass = 0
+        # Enumerate every pow2 bucket the runtime binning can produce, from a starved
+        # floor up to MAX_ROWS, and compile each on every rank (cycle the target p).
+        # The floor reaches ~9 octaves below MAX (but never below W*K, the smallest
+        # representable target) -- deep enough to cover the moderate-starvation buckets
+        # a rank lands in when its local experts go cold during the router-collapse
+        # transient, which the earlier balanced/high-only sweep skipped. T_local is
+        # fixed, so the workspace already covers MAX_ROWS (no OOM at the top bucket).
+        max_rows = T_local * W * min(K, E_local)  # == MAX_ROWS_PER_RANK_STATIC
+        hi = max_rows.bit_length() - 1
+        lo = max((W * K).bit_length() - 1, hi - 9)
+        passes = [(1 << e, p) for e in range(lo, hi + 1) for p in range(W)]
+        for B, p in passes:
+            try:
+                _run(_routing(B, p))
+                npass += 1
+            except Exception as e:
+                if npass <= 1:
+                    log.warning(f"EP warmup pass (B={B}, p={p}) failed: {e!r}")
+        log.info(f"EP fwd+bwd warmup complete: {npass}/{len(passes)} passes (W={W}, E_local={E_local}, T_local={T_local})")
+    except Exception as e:
+        log.warning(f"EP warmup skipped: {e!r}")
+
+
+@torch._dynamo.disable
 def moe_ep_TC_softmax_topk_forward(
     x: torch.Tensor,
     router_w: torch.Tensor,
@@ -1107,6 +1261,26 @@ def moe_ep_TC_softmax_topk_forward(
     _validate_runtime_ep_config(ep_config, W, K)
     activation_type = _normalize_activation(activation_type)
     T_local, d = x.shape
+
+    # First call only: pre-compile all forward+backward gemm kernels (see
+    # warmup_ep_kernels) so routing-imbalance-driven new buckets never JIT-stall
+    # mid-training. No-op after the first invocation.
+    if not _EP_WARMED:
+        warmup_ep_kernels(
+            x,
+            w1,
+            w2,
+            b1,
+            b2,
+            E,
+            K,
+            group=group,
+            layer_id=layer_id,
+            activation_type=activation_type,
+            concat_layout=concat_layout,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
+            ep_config=ep_config,
+        )
 
     # Build the call-local cfg by promoting the user's (dispatch, combine,
     # W, K) selection with the layer-static fields that
