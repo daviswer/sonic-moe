@@ -452,7 +452,9 @@ def _run_ep_tc_one(
     b1_t = b1_local.detach().clone().requires_grad_(True) if b1_local is not None else None
     b2_t = b2_local.detach().clone().requires_grad_(True) if b2_local is not None else None
 
-    y_local = moe_ep_TC_softmax_topk_forward(
+    # moe_ep_TC_softmax_topk_forward returns (out, router_logits, expert_frequency);
+    # this test compares only the MoE output + its grads.
+    y_local, _router_logits, _expert_freq = moe_ep_TC_softmax_topk_forward(
         x_t,
         router_w_t,
         w1_t,
@@ -477,6 +479,11 @@ def _run_ep_tc_one(
     dx_local, drouter_w_local, dw1_local, dw2_local = grads[:4]
     db1_local = grads[4] if b1_t is not None else None
     db2_local = grads[5] if b1_t is not None else None
+
+    # For router_w replicated across ranks (and running on local tokens),
+    # reduce the grad manually (training code handles this e.g. FSDP)
+    drouter_w_local = drouter_w_local.contiguous()
+    dist.all_reduce(drouter_w_local, op=dist.ReduceOp.SUM)
 
     y_full = _all_gather_y(y_local.detach(), world_size)
     dx_full = _all_gather_y(dx_local, world_size)
@@ -519,7 +526,8 @@ def _run_ep_general_one_fwd(
     3×3 dispatch×combine matrix on the general entry point; TC covers
     the backward sweep."""
     w1_no_grad = _strided_clone(w1_local)
-    y_local = moe_ep_general_routing_forward(
+    # moe_ep_general_routing_forward returns (out, expert_frequency).
+    y_local, _expert_freq = moe_ep_general_routing_forward(
         x_local,
         idx_local,
         scores_local,

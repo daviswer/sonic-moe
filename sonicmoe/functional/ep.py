@@ -84,6 +84,23 @@ from .distributed import (
 )
 from .metadata import general_routing_router_metadata_triton
 
+
+def _floor_bin_exp(max_rows: int, W: int) -> int:
+    """Impose a floor on the runtime-row-count bin size (twice uniform expected load)"""
+    uniform = max_rows // W  # per-rank rows under uniform routing (= T_local*min(K,E_local))
+    return max(2 * uniform - 1, 0).bit_length()
+
+
+def _binned_max_rows(actual: int, cfg: RuntimeEPConfig) -> int:
+    """Bin runtime row count to the nearest power of 2 to avoid memory/kernel/tuner
+    thrashing. Lower bound set to twice the expected load under uniform routing, 
+    so that it lands almost all the time, forcing near-constant execution patterns.""" 
+    MAX = cfg.MAX_ROWS_PER_RANK_STATIC
+    floor_bin = 1 << _floor_bin_exp(MAX, cfg.W)  # smallest pow2 >= 2x uniform load
+    actual_bin = 1 << max(actual - 1, 0).bit_length()
+    return min(max(actual_bin, floor_bin), MAX)
+
+
 # Symm mem doesn't play nicely with torch.compile, so we pre-compile
 # the subfunctions that we are able to:
 def _router_forward(x, router_w, E, K, is_softmax_over_topk, norm_topk_probs):
@@ -98,7 +115,6 @@ _compiled_dispatch_metadata = torch.compile(compute_dispatch_metadata)
 __all__ = [
     "CombineMode",
     "DispatchMode",
-    "EP_Router_Replicated_Across_Ranks",
     "NetworkProfiler",
     "RuntimeEPConfig",
     "SymmMemManager",
@@ -106,30 +122,6 @@ __all__ = [
     "moe_ep_TC_softmax_topk_forward",
     "moe_ep_general_routing_forward",
 ]
-
-
-class EP_Router_Replicated_Across_Ranks(torch.autograd.Function):
-    """``F.linear(x, router_w)`` with EP-aware drouter_w all-reduce.
-
-    In EP, each rank holds ``T_local`` tokens of the global batch
-    (``T_global = T_local * W``) and every rank has a replica of
-    ``router_w``.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, router_w: torch.Tensor, ep_group):
-        ctx.save_for_backward(x, router_w)
-        ctx.ep_group = ep_group
-        return F.linear(x, router_w)
-
-    @staticmethod
-    def backward(ctx, dlogits: torch.Tensor):
-        x, router_w = ctx.saved_tensors
-        ep_group = ctx.ep_group
-        dx = dlogits @ router_w
-        drouter_w_local = dlogits.transpose(-2, -1) @ x
-        dist.all_reduce(drouter_w_local, op=dist.ReduceOp.SUM, group=ep_group)
-        return dx, drouter_w_local, None
 
 
 def _normalize_activation(activation_type) -> ActivationType:
@@ -348,11 +340,8 @@ class _MoeEPFunction(torch.autograd.Function):
         max_rows_per_rank_runtime = MAX_ROWS_PER_RANK_STATIC
         if CPU_sync_on_runtime:
             actual = expert_frequency_offset[E_local].item()
-            # Round up to the next power of two so Triton/QuACK autotune
-            # keys stay within O(log W) distinct values rather than varying
-            # every step and thrashing the cache.
-            binned = 1 << max(actual - 1, 0).bit_length()
-            max_rows_per_rank_runtime = min(binned, MAX_ROWS_PER_RANK_STATIC)
+            # Bin the count to power-of-2 for steady execution and tuning
+            max_rows_per_rank_runtime = _binned_max_rows(actual, cfg)
 
         # ====================================================================
         # 1. Dispatch x → x_compute
@@ -760,7 +749,7 @@ class _MoeEPFunction(torch.autograd.Function):
             A_idx=a_idx_for_dout,
             batch_idx_permute=None,
             dynamic_scheduler=False,
-            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
+            tuned=True,
         )
         del dout_dispatched, dout_for_kernel, a_prime, h, topk_scores_global
 
@@ -834,7 +823,7 @@ class _MoeEPFunction(torch.autograd.Function):
             batch_idx_permute=None,
             dynamic_scheduler=False,
             concat_layout=(("out",) if concat_layout else None),
-            tuned=False,  # TODO: (Davis) broken pipe errors, resolve this later preferably
+            tuned=True,
         )
 
         ep_ws.o_hdl.barrier()
@@ -1158,7 +1147,7 @@ def warmup_ep_kernels(
             # then ~W*n_hot*K ~= B (not flooded to balanced), so sweeping B over every
             # pow2 from a starved floor up to MAX lands the target on each bucket
             # exactly. Cycling p over all W ranks makes every rank compile every
-            # bucket in-process (and writes each to the shared on-disk .o cache).
+            # bucket in-process.
             ti = _draw_skip(T_local, p)
             if can_local:
                 n_hot = min(max(round(B / (W * K)), 1), T_local)
@@ -1188,16 +1177,11 @@ def warmup_ep_kernels(
             out.float().sum().backward()
 
         npass = 0
-        # Enumerate every pow2 bucket the runtime binning can produce, from a starved
-        # floor up to MAX_ROWS, and compile each on every rank (cycle the target p).
-        # The floor reaches ~9 octaves below MAX (but never below W*K, the smallest
-        # representable target) -- deep enough to cover the moderate-starvation buckets
-        # a rank lands in when its local experts go cold during the router-collapse
-        # transient, which the earlier balanced/high-only sweep skipped. T_local is
-        # fixed, so the workspace already covers MAX_ROWS (no OOM at the top bucket).
+        # Enumerate every pow2 bucket the runtime binning can produce, from the floor
+        # bin up to MAX_ROWS, and compile each on every rank (cycle the target p).
         max_rows = T_local * W * min(K, E_local)  # == MAX_ROWS_PER_RANK_STATIC
         hi = max_rows.bit_length() - 1
-        lo = max((W * K).bit_length() - 1, hi - 9)
+        lo = _floor_bin_exp(max_rows, W)
         passes = [(1 << e, p) for e in range(lo, hi + 1) for p in range(W)]
         for B, p in passes:
             try:
@@ -1235,9 +1219,9 @@ def moe_ep_TC_softmax_topk_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """EP forward with TC softmax-topk router.
 
-    Uses :class:`EP_Router_Replicated_Across_Ranks` for the router projection so the backward
-    automatically all-reduces ``drouter_w`` across the EP group — each
-    rank's ``router_w`` accumulates the global-batch gradient.
+    The router projection is a plain ``F.linear``; its ``drouter_w`` is left to autograd
+    and reduced across the EP group by FSDP (``router_w`` is replicated, sharded over the
+    ``fsdp = fsdp_ep * ep`` mesh), so no in-kernel all-reduce is needed here.
 
     The symm-mem workspace is cached per ``(group, x.device, layer_id)`` to avoid buffer
     sharing across layers during training (which breaks gradient computation). Pass
@@ -1305,10 +1289,6 @@ def moe_ep_TC_softmax_topk_forward(
 
     ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
 
-    # Router projection with EP-aware drouter_w all-reduce.
-    # router_logits = EP_Router_Replicated_Across_Ranks.apply(x, router_w, ws.ep_group)
-
-    # Skip drouter_w all-reduce because fsdp is handling that for us
     topk_scores_l, topk_idx_l, router_logits = _compiled_router_forward(
         x, router_w, W * E_local, K, is_softmax_over_topk, norm_topk_probs
     )
