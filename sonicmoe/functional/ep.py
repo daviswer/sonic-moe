@@ -1294,8 +1294,10 @@ def moe_ep_TC_softmax_topk_forward(
     )
 
     # Publish x to peers (forward x dispatch in _moe_ep_forward_inner
-    # reads peer x_symm), then collect topk_idx across ranks.
-    ws.x_symm.copy_(x)
+    # reads peer x_symm), then collect topk_idx across ranks. The no_grad detaches the autograd
+    # graph from the long-lived x_symm buffer, which would otherwise leak it every step.
+    with torch.no_grad():
+        ws.x_symm.copy_(x)
     topk_idx_g = _ag_routing_decision(ws, topk_idx_l)
     ws.x_hdl.barrier()
 
@@ -1374,7 +1376,9 @@ def moe_ep_general_routing_forward(
     )
 
     ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
-    ep_ws.x_symm.copy_(x)
+    # no_grad: see moe_ep_TC_softmax_topk_forward -- keeps x_symm from retaining the graph.
+    with torch.no_grad():
+        ep_ws.x_symm.copy_(x)
 
     topk_idx_g = _ag_routing_decision(ep_ws, topk_indices.to(torch.int32))
     ep_ws.x_hdl.barrier()
