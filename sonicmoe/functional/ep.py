@@ -85,18 +85,19 @@ from .distributed import (
 from .metadata import general_routing_router_metadata_triton
 
 
-def _floor_bin_exp(max_rows: int, W: int) -> int:
+def _floor_bin_exp(max_rows: int, W: int, K: int, E_local: int) -> int:
     """Impose a floor on the runtime-row-count bin size (twice uniform expected load)"""
-    uniform = max_rows // W  # per-rank rows under uniform routing (= T_local*min(K,E_local))
-    return max(2 * uniform - 1, 0).bit_length()
+    T_local = max_rows // (W * min(K, E_local))
+    uniform = T_local * K  # true per-rank load under uniform routing; == max_rows // W only when E_local >= K
+    return max(min(2 * uniform, max_rows) - 1, 0).bit_length()
 
 
 def _binned_max_rows(actual: int, cfg: RuntimeEPConfig) -> int:
     """Bin runtime row count to the nearest power of 2 to avoid memory/kernel/tuner
-    thrashing. Lower bound set to twice the expected load under uniform routing, 
-    so that it lands almost all the time, forcing near-constant execution patterns.""" 
+    thrashing. Lower bound set to twice the expected load under uniform routing,
+    so that it lands almost all the time, forcing near-constant execution patterns."""
     MAX = cfg.MAX_ROWS_PER_RANK_STATIC
-    floor_bin = 1 << _floor_bin_exp(MAX, cfg.W)  # smallest pow2 >= 2x uniform load
+    floor_bin = 1 << _floor_bin_exp(MAX, cfg.W, cfg.K, cfg.E_local)  # smallest pow2 >= 2x uniform load
     actual_bin = 1 << max(actual - 1, 0).bit_length()
     return min(max(actual_bin, floor_bin), MAX)
 
@@ -1184,7 +1185,7 @@ def warmup_ep_kernels(
         # bin up to MAX_ROWS, and compile each on every rank (cycle the target p).
         max_rows = T_local * W * min(K, E_local)  # == MAX_ROWS_PER_RANK_STATIC
         hi = max_rows.bit_length() - 1
-        lo = _floor_bin_exp(max_rows, W)
+        lo = _floor_bin_exp(max_rows, W, K, E_local)
         passes = [(1 << e, p) for e in range(lo, hi + 1) for p in range(W)]
         for B, p in passes:
             try:
