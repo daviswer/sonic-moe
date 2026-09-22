@@ -189,7 +189,10 @@ class Shape:
 
 
 SHAPES: List[Shape] = [
+    # K spans K < W, K == W and K > W at the W=4 single-node default; K_eq_4 is the topology the
+    # training configs use (E=48, K=4 -> E_local=12), which the sweep originally skipped.
     Shape("K_eq_2", T=4096, H=2048, I=1024, E=32, K=2),
+    Shape("K_eq_4", T=4096, H=2048, I=1024, E=48, K=4),
     Shape("K_eq_8", T=4096, H=2048, I=1024, E=64, K=8),
     Shape("K_eq_10", T=4096, H=2048, I=512, E=64, K=10),
 ]
@@ -414,7 +417,17 @@ def _check_quantities(
             msgs.append(f"{name}:OK")
         except AssertionError:
             ok_all = False
-            msgs.append(f"{name}:FAIL[max={max_d:.2e} rel={mean_r:.2e}]")
+            # ep/ref over the significant entries: a flat ratio means a pure scale factor
+            # (e.g. a missing 1/W), a spread means the mismatch is structural
+            sig = (ref_f.abs() > ref_f.abs().max() * 1e-3).nonzero().flatten()
+            if sig.numel() > 1 << 20:
+                sig = sig[torch.randperm(sig.numel(), device=sig.device)[: 1 << 20]]
+            ratio_txt = ""
+            if sig.numel() > 0:
+                r = (ep_f.flatten()[sig] / ref_f.flatten()[sig]).float()
+                q = torch.quantile(r, torch.tensor([0.01, 0.5, 0.99], device=r.device))
+                ratio_txt = f" ep/ref p1={q[0]:.4f} p50={q[1]:.4f} p99={q[2]:.4f}"
+            msgs.append(f"{name}:FAIL[max={max_d:.2e} rel={mean_r:.2e}{ratio_txt}]")
     head = f"{log_prefix}{tag}"
     marker = "✓ PASS" if ok_all else "✗ FAIL"
     return ok_all, f"{head:<88s} {marker}  " + "  ".join(msgs)
@@ -762,16 +775,18 @@ def _run_one_shape(
                         continue
                     if rank == 0:
                         y_full, ep_dx, ep_drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
+                        # backward returns expert grads pre-divided by W (see ep.py); the oracle is
+                        # a global sum, so scale it. drouter_w is exempt: already SUM-reduced.
                         quantities = [
                             ("o", y_full, ref_o),
                             ("dx", ep_dx, ref_dx),
                             ("drouter_w", ep_drouter_w, ref_drouter_w),
-                            ("dw1", ep_dw1, ref_dw1.permute(1, 2, 0)),  # (2I, H, E)
-                            ("dw2", ep_dw2, ref_dw2.permute(0, 2, 1)),  # (E, I, H)
+                            ("dw1", ep_dw1, ref_dw1.permute(1, 2, 0) / world_size),  # (2I, H, E)
+                            ("dw2", ep_dw2, ref_dw2.permute(0, 2, 1) / world_size),  # (E, I, H)
                         ]
                         if ep_db1 is not None:
-                            quantities.append(("db1", ep_db1, ref_db1))
-                            quantities.append(("db2", ep_db2, ref_db2))
+                            quantities.append(("db1", ep_db1, ref_db1 / world_size))
+                            quantities.append(("db2", ep_db2, ref_db2 / world_size))
                         ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
                         print(msg)
                         if ok:

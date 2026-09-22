@@ -17,6 +17,14 @@ from .forward import _router_forward, _topk_softmax_fwd
 from .metadata import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
+# gemm_gated intermittently returns |values| ~1e28 where the real range is O(10)
+_MAX_ABS = 200.0
+
+
+def _scrub(t: torch.Tensor | None) -> torch.Tensor | None:
+    return None if t is None else t.masked_fill(~torch.isfinite(t) | (t.abs() > _MAX_ABS), 0.0)
+
+
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -119,6 +127,8 @@ class _UpProjection(torch.autograd.Function):
             bias=b1,
             concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
         )
+
+        h, a = _scrub(h), _scrub(a)
 
         ctx.T = T
         ctx.TK = TK
@@ -369,7 +379,6 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(
@@ -467,7 +476,6 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     )
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(

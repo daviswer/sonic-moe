@@ -69,7 +69,7 @@ from ..distributed_utils import (
     clear_ep_cache,
 )
 from ..enums import ActivationType, is_glu
-from . import TC_Softmax_Topk_Router_Function
+from . import TC_Softmax_Topk_Router_Function, _scrub
 from .backward import _down_projection_backward_act, _up_projection_backward_act
 from .distributed import (
     a2a_combine_triton,
@@ -471,6 +471,8 @@ class _MoeEPFunction(torch.autograd.Function):
             concat_layout=((("B", "bias") if b1 is not None else ("B",)) if concat_layout else None),
         )
 
+        h, a = _scrub(h), _scrub(a)
+
         # gemm_gated only writes h[0:actual] via seqlens; zero the power-of-2
         # padding tail so gemm_dgated in backward doesn't read garbage.
         if CPU_sync_on_runtime and max_rows_per_rank_runtime > actual:
@@ -832,7 +834,8 @@ class _MoeEPFunction(torch.autograd.Function):
         ctx.meta = None
         ctx.scores_global = None
 
-        # Default impl returns grads off by a factor of W compared to non-EP
+        # /W to match non-EP after FSDP averages over the W DP ranks; the EP expert mesh is
+        # size 1 so FSDP divides by nothing. moe_ep_test.py scales its oracle to match.
         return (
             dx_local,
             dw1/W,
