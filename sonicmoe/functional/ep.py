@@ -1384,6 +1384,8 @@ def moe_ep_general_routing_forward(
     with torch.no_grad():
         ep_ws.x_symm.copy_(x)
 
+    topk_scores = topk_scores.float()  # gemm_dgated's colvec_scale expects fp32
+
     topk_idx_g = _ag_routing_decision(ep_ws, topk_indices.to(torch.int32))
     ep_ws.x_hdl.barrier()
 

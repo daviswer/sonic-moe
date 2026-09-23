@@ -42,10 +42,9 @@ os.environ["QUACK_COMPILE_WORKERS"] = "1"
 
 
 # ─────────────── Monkey-patch: similar M shapes map to the same cached config during QuACK autotuning ───────────────
-# Mirrors ``benchmarks/distributed/moe-ep.py``; without these patches the
-# QuACK autotuner picks tiles for ``gemm_dgated`` at the test's smaller
-# shapes that hit a bf16 alignment ICE in epi_ops. Same restricted
-# config set the bench uses keeps both files consistent.
+# Mirrors ``benchmarks/distributed/moe-ep.py``: quantizing M in the autotune cache key
+# stops re-tuning on every shape, and the same restricted config set keeps both files
+# consistent.
 
 M_QUANT = 1024
 
@@ -348,7 +347,7 @@ def _per_expert_reference_tc(
     )
 
 
-def _per_expert_reference_general_fwd(
+def _per_expert_reference_general(
     x_global: torch.Tensor,
     w1_full: torch.Tensor,
     w2_full: torch.Tensor,
@@ -357,15 +356,26 @@ def _per_expert_reference_general_fwd(
     topk_idx_global: torch.Tensor,
     topk_scores_global: torch.Tensor,
     concat_layout: bool,
-) -> torch.Tensor:
-    """General-routing forward reference in fp32 — output only (no bwd).
-    See ``_run_ep_general_one_fwd`` for why general is forward-only here."""
-    ref_x = x_global.to(torch.float32)
-    ref_scores = topk_scores_global.to(torch.float32)
-    ref_w1 = w1_full.to(torch.float32)
-    ref_w2 = w2_full.to(torch.float32)
-    ref_b1 = b1_full.to(torch.float32) if b1_full is not None else None
-    ref_b2 = b2_full.to(torch.float32) if b2_full is not None else None
+    dout_global: torch.Tensor,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """General-routing reference: per-expert MoE forward + autograd backward in fp32.
+
+    Routing is caller-supplied, so there is no router to differentiate — the grad of the
+    supplied scores (``ds``) takes ``drouter_w``'s place."""
+    ref_x = x_global.detach().to(torch.float32).requires_grad_(True)
+    ref_scores = topk_scores_global.detach().to(torch.float32).requires_grad_(True)
+    ref_w1 = w1_full.detach().to(torch.float32).requires_grad_(True)
+    ref_w2 = w2_full.detach().to(torch.float32).requires_grad_(True)
+    ref_b1 = b1_full.detach().to(torch.float32).requires_grad_(True) if b1_full is not None else None
+    ref_b2 = b2_full.detach().to(torch.float32).requires_grad_(True) if b2_full is not None else None
 
     T, H = ref_x.shape
     E = ref_w1.shape[0]
@@ -387,7 +397,24 @@ def _per_expert_reference_general_fwd(
         )
         contrib = y * ref_scores[rows_t, rows_k, None]
         out = out.index_add(0, rows_t, contrib)
-    return out
+
+    inputs = [ref_x, ref_scores, ref_w1, ref_w2]
+    if ref_b1 is not None:
+        inputs += [ref_b1, ref_b2]
+    grads = torch.autograd.grad(out, inputs, grad_outputs=dout_global.to(torch.float32))
+
+    ref_dx, ref_ds, ref_dw1, ref_dw2 = grads[:4]
+    ref_db1 = grads[4] if ref_b1 is not None else None
+    ref_db2 = grads[5] if ref_b1 is not None else None
+    return (
+        out.detach(),
+        ref_dx.detach(),
+        ref_ds.detach(),
+        ref_dw1.detach(),
+        ref_dw2.detach(),
+        ref_db1.detach() if ref_db1 is not None else None,
+        ref_db2.detach() if ref_db2 is not None else None,
+    )
 
 
 # ============================================================================
@@ -532,12 +559,8 @@ def _run_ep_general_one_fwd(
     rank: int,
 ):
     """Run general-routing EP forward in inference mode and return y_full
-    on rank 0. Inference mode is used because training-mode + general
-    routing currently trips a QuACK DSL ICE in ``epi_ops.cute.copy``
-    (bf16 column-vector alignment) when ``gemm_dgated`` autotunes for
-    the test's smaller shapes. Forward-only is enough to exercise the
-    3×3 dispatch×combine matrix on the general entry point; TC covers
-    the backward sweep."""
+    on rank 0. Forward-only is enough to exercise the 3×3 dispatch×combine
+    matrix on the general entry point; TC covers the backward sweep."""
     w1_no_grad = _strided_clone(w1_local)
     # moe_ep_general_routing_forward returns (out, expert_frequency).
     y_local, _expert_freq = moe_ep_general_routing_forward(
@@ -557,6 +580,72 @@ def _run_ep_general_one_fwd(
     y_full = _all_gather_y(y_local.detach(), world_size)
     if rank == 0:
         return y_full
+
+
+def _run_ep_general_one_train(
+    x_local: torch.Tensor,
+    idx_local: torch.Tensor,
+    scores_local: torch.Tensor,
+    w1_local: torch.Tensor,
+    w2_local: torch.Tensor,
+    b1_local: Optional[torch.Tensor],
+    b2_local: Optional[torch.Tensor],
+    dout_local: torch.Tensor,
+    E: int,
+    cfg: RuntimeEPConfig,
+    concat_layout: bool,
+    world_size: int,
+    rank: int,
+):
+    """Run one general-routing EP fwd+bwd in training mode; gather per-rank grads to
+    rank 0. Returns (y_full, dx_full, ds_full, ep_dw1, ep_dw2, ep_db1, ep_db2) on rank 0,
+    ``None`` elsewhere. The pre-flight arm calls this and discards the result."""
+    x_t = x_local.detach().clone().requires_grad_(True)
+    scores_t = scores_local.detach().clone().requires_grad_(True)
+    w1_t = _strided_clone(w1_local).requires_grad_(True)
+    w2_t = w2_local.detach().clone().requires_grad_(True)
+    b1_t = b1_local.detach().clone().requires_grad_(True) if b1_local is not None else None
+    b2_t = b2_local.detach().clone().requires_grad_(True) if b2_local is not None else None
+
+    y_local, _expert_freq = moe_ep_general_routing_forward(
+        x_t,
+        idx_local,
+        scores_t,
+        w1_t,
+        b1_t,
+        w2_t,
+        b2_t,
+        E=E,
+        activation_type=ActivationType.SWIGLU,
+        is_inference_mode_enabled=False,
+        concat_layout=concat_layout,
+        ep_config=cfg,
+    )
+    inputs = [x_t, scores_t, w1_t, w2_t]
+    if b1_t is not None:
+        inputs += [b1_t, b2_t]
+    grads = torch.autograd.grad(y_local, inputs, grad_outputs=dout_local, retain_graph=False)
+
+    dx_local, ds_local, dw1_local, dw2_local = grads[:4]
+    db1_local = grads[4] if b1_t is not None else None
+    db2_local = grads[5] if b1_t is not None else None
+
+    y_full = _all_gather_y(y_local.detach(), world_size)
+    dx_full = _all_gather_y(dx_local, world_size)
+    # ds is per-token like dx: the backward reduce-scatters it, so each rank's (T_local, K)
+    # slice is already complete and needs no cross-rank sum (unlike TC's replicated router_w).
+    ds_full = _all_gather_y(ds_local, world_size)
+    dw1_list = _gather_to_rank0(dw1_local, world_size, rank)
+    dw2_list = _gather_to_rank0(dw2_local, world_size, rank)
+    db1_list = _gather_to_rank0(db1_local, world_size, rank) if db1_local is not None else None
+    db2_list = _gather_to_rank0(db2_local, world_size, rank) if db2_local is not None else None
+
+    if rank == 0:
+        ep_dw1 = torch.cat(dw1_list, dim=2)  # (2I, H, E_local) per rank -> (2I, H, E)
+        ep_dw2 = torch.cat(dw2_list, dim=0)  # (E_local, I, H) per rank -> (E, I, H)
+        ep_db1 = torch.cat(db1_list, dim=0) if db1_list is not None else None
+        ep_db2 = torch.cat(db2_list, dim=0) if db2_list is not None else None
+        return y_full, dx_full, ds_full, ep_dw1, ep_dw2, ep_db1, ep_db2
     return None
 
 
@@ -616,6 +705,7 @@ def _run_one_shape(
     atol: float,
     rtol: float,
     seed: int,
+    general_preflight: bool = False,
 ) -> ShapeStats:
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
     assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
@@ -696,6 +786,34 @@ def _run_one_shape(
     dist.broadcast(idx_g, src=0)
     scores_local = scores_g[rank * T_local : (rank + 1) * T_local].contiguous()
     idx_local = idx_g[rank * T_local : (rank + 1) * T_local].to(torch.int32).contiguous()
+
+    if general_preflight:
+        cfg = RuntimeEPConfig(dispatch_mode=DISPATCH_MODES[0], W=world_size, K=K, combine_mode=COMBINE_MODES[0])
+        tag = f"general-preflight[dispatch={DISPATCH_MODES[0].value},combine={COMBINE_MODES[0].value}]"
+        try:
+            _run_ep_general_one_train(
+                x_local,
+                idx_local,
+                scores_local,
+                w1_local,
+                w2_local,
+                None,
+                None,
+                dout_local,
+                E,
+                cfg,
+                concat_layout,
+                world_size,
+                rank,
+            )
+            if rank == 0:
+                print(f"{tag} PASS — training-mode general routing forward+backward succeeded, no ICE")
+        except Exception:
+            if rank == 0:
+                print(f"{tag} FAIL — exception during training-mode general routing:")
+                traceback.print_exc()
+            raise
+        return stats
 
     # ------------------------------------------------------------------------
     # Sweep: bias × routing-variant × 3×3 (dispatch × combine) × entry point.
@@ -796,17 +914,20 @@ def _run_one_shape(
                             stats.failures.append(tag)
                     dist.barrier()
 
-        # ────────── entry point #2: general_routing_forward (fwd-only) ──────────
+        # ────────── entry point #2: general_routing_forward ──────────
         if rank == 0:
-            ref_o_g = _per_expert_reference_general_fwd(
-                x_global,
-                w1_full,
-                w2_full,
-                b1_full,
-                b2_full,
-                idx_g,
-                scores_g,
-                concat_layout,
+            ref_o_g, ref_dx_g, ref_ds_g, ref_dw1_g, ref_dw2_g, ref_db1_g, ref_db2_g = (
+                _per_expert_reference_general(
+                    x_global,
+                    w1_full,
+                    w2_full,
+                    b1_full,
+                    b2_full,
+                    idx_g,
+                    scores_g,
+                    concat_layout,
+                    dout_global,
+                )
             )
 
         for dispatch_mode in DISPATCH_MODES:
@@ -850,6 +971,62 @@ def _run_one_shape(
                         stats.fail_count += 1
                         stats.failures.append(tag)
                 dist.barrier()
+
+        # ────────── entry point #2b: general_routing_forward in training mode (fwd + bwd) ──────────
+        for dispatch_mode in DISPATCH_MODES:
+            for combine_mode in COMBINE_MODES:
+                cfg = RuntimeEPConfig(
+                    dispatch_mode=dispatch_mode,
+                    W=world_size,
+                    K=K,
+                    combine_mode=combine_mode,
+                )
+                tag = f"general-train[dispatch={dispatch_mode.value},combine={combine_mode.value}]"
+                try:
+                    result = _run_ep_general_one_train(
+                        x_local,
+                        idx_local,
+                        scores_local,
+                        w1_local,
+                        w2_local,
+                        b1_local,
+                        b2_local,
+                        dout_local,
+                        E,
+                        cfg,
+                        concat_layout,
+                        world_size,
+                        rank,
+                    )
+                except Exception as e:
+                    if rank == 0:
+                        print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                        stats.fail_count += 1
+                        stats.failures.append(f"{tag} (exception)")
+                    dist.barrier()
+                    continue
+                if rank == 0:
+                    y_full, ep_dx, ep_ds, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
+                    # expert grads come back pre-divided by W (see ep.py); the oracle is a global
+                    # sum, so scale it. o/dx/ds are per-token quantities and need no scaling.
+                    quantities = [
+                        ("o", y_full, ref_o_g),
+                        ("dx", ep_dx, ref_dx_g),
+                        ("ds", ep_ds, ref_ds_g),
+                        ("dw1", ep_dw1, ref_dw1_g.permute(1, 2, 0) / world_size),  # (2I, H, E)
+                        ("dw2", ep_dw2, ref_dw2_g.permute(0, 2, 1) / world_size),  # (E, I, H)
+                    ]
+                    if ep_db1 is not None:
+                        quantities.append(("db1", ep_db1, ref_db1_g / world_size))
+                        quantities.append(("db2", ep_db2, ref_db2_g / world_size))
+                    ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
+                    print(msg)
+                    if ok:
+                        stats.pass_count += 1
+                    else:
+                        stats.fail_count += 1
+                        stats.failures.append(tag)
+                dist.barrier()
         dist.barrier()
 
     return stats
@@ -879,6 +1056,13 @@ def main() -> int:
         "--concat-layout",
         action="store_true",
         help="Test the concat [g; u] up-proj layout instead of interleaved.",
+    )
+    parser.add_argument(
+        "--general-preflight",
+        action="store_true",
+        help="ep-port-phase2 step 1 pre-flight: run one general-routing fwd+bwd in "
+        "training mode (K_eq_4 shape, one dispatch/combine pair) and report whether "
+        "the QuACK DSL ICE still reproduces. Skips the full sweep.",
     )
     args = parser.parse_args()
 
@@ -930,9 +1114,10 @@ def main() -> int:
             f"comparing fwd + bwd grads against an fp32 PyTorch autograd reference.\n"
         )
 
+    shapes = [s for s in SHAPES if s.name == "K_eq_4"] if args.general_preflight else SHAPES
     all_stats: List[ShapeStats] = []
     try:
-        for shape in SHAPES:
+        for shape in shapes:
             try:
                 stats = _run_one_shape(
                     rank,
@@ -944,6 +1129,7 @@ def main() -> int:
                     atol=5e-2,
                     rtol=5e-2,
                     seed=1111,
+                    general_preflight=args.general_preflight,
                 )
             except Exception as e:
                 if rank == 0:
