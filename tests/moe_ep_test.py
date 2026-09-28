@@ -20,11 +20,22 @@
 #            tests/moe_ep_test.py
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
 #            tests/moe_ep_test.py --concat-layout
+#
+# --ep-world-size splits WORLD_SIZE ranks into WORLD_SIZE/ep-world-size independent
+# EP groups of ep_world_size ranks each (contiguous rank blocks), so this same driver
+# also covers the hybrid `ep < dps` (fsdp_ep > 1) topology: each group runs the full
+# fp32-oracle check as if it were its own standalone EP world, using its own
+# dist.new_group rather than the default WORLD group for every collective. Implicitly
+# forces --only-nccl (see that flag's help) since a hybrid group's ranks are placed to
+# be cross-node by construction. E.g. 2 EP groups of 2 across 4 nodes:
+#
+#   torchrun --nnodes=4 --nproc_per_node=1 ... tests/moe_ep_test.py --ep-world-size 2
 # ********************************************************************************
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import itertools
 import os
 import sys
@@ -215,6 +226,16 @@ COMBINE_MODES: List[CombineMode] = [
     CombineMode.RANK_DEDUP_COMBINE_TRITON,
 ]
 
+# The 3x3 sweep above is a free cartesian product -- combine mode is orthogonal
+# to dispatch mode for all three symm-mem pairs. A2A_NCCL is not: dispatch_mode
+# and combine_mode must both be A2A_NCCL together (see _validate_runtime_ep_config
+# -- mixing it with a symm-mem mode would attempt a symm-mem rendezvous on a
+# cross-node group and hang), so it's tested as one explicit extra pair rather
+# than added to the cartesian sweep above.
+DISPATCH_COMBINE_MODE_PAIRS: List[Tuple[DispatchMode, CombineMode]] = [
+    (d, c) for d in DISPATCH_MODES for c in COMBINE_MODES
+] + [(DispatchMode.A2A_NCCL, CombineMode.A2A_NCCL)]
+
 
 # ============================================================================
 # Helpers
@@ -229,19 +250,25 @@ def _swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     return u * F.silu(g)
 
 
-def _all_gather_y(y_local: torch.Tensor, world_size: int) -> torch.Tensor:
-    """All-gather a (T_local, *trailing) tensor along dim 0 into (W*T_local, *trailing)."""
+def _all_gather_y(
+    y_local: torch.Tensor, world_size: int, group: Optional[dist.ProcessGroup] = None
+) -> torch.Tensor:
+    """All-gather a (T_local, *trailing) tensor along dim 0 into (W*T_local, *trailing),
+    scoped to `group` (None = the default WORLD group)."""
     out_shape = (world_size * y_local.shape[0],) + tuple(y_local.shape[1:])
     out = torch.empty(out_shape, dtype=y_local.dtype, device=y_local.device)
-    dist.all_gather_into_tensor(out, y_local.contiguous())
+    dist.all_gather_into_tensor(out, y_local.contiguous(), group=group)
     return out
 
 
-def _gather_to_rank0(t_local: torch.Tensor, world_size: int, rank: int) -> Optional[List[torch.Tensor]]:
-    """Gather t_local from every rank into a list of W tensors on rank 0."""
+def _gather_to_rank0(
+    t_local: torch.Tensor, world_size: int, rank: int, group: Optional[dist.ProcessGroup] = None
+) -> Optional[List[torch.Tensor]]:
+    """Gather t_local from every rank in `group` into a list of W tensors on that
+    group's local rank 0 (`rank` is already group-relative)."""
     t_local = t_local.contiguous()
     out = torch.empty((world_size,) + tuple(t_local.shape), dtype=t_local.dtype, device=t_local.device)
-    dist.all_gather_into_tensor(out, t_local)
+    dist.all_gather_into_tensor(out, t_local, group=group)
     if rank == 0:
         return list(out.unbind(dim=0))
     return None
@@ -481,6 +508,7 @@ def _run_ep_tc_one(
     concat_layout: bool,
     world_size: int,
     rank: int,
+    group: Optional[dist.ProcessGroup] = None,
 ):
     """Run one TC EP fwd+bwd; gather per-rank grads to rank 0. Returns the
     (y_full, dx_full, drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2) tuple on
@@ -503,6 +531,7 @@ def _run_ep_tc_one(
         b2_t,
         K=K,
         E=E,
+        group=group,
         activation_type=ActivationType.SWIGLU,
         is_inference_mode_enabled=False,
         is_softmax_over_topk=is_softmax_over_topk,
@@ -523,14 +552,14 @@ def _run_ep_tc_one(
     # For router_w replicated across ranks (and running on local tokens),
     # reduce the grad manually (training code handles this e.g. FSDP)
     drouter_w_local = drouter_w_local.contiguous()
-    dist.all_reduce(drouter_w_local, op=dist.ReduceOp.SUM)
+    dist.all_reduce(drouter_w_local, op=dist.ReduceOp.SUM, group=group)
 
-    y_full = _all_gather_y(y_local.detach(), world_size)
-    dx_full = _all_gather_y(dx_local, world_size)
-    dw1_list = _gather_to_rank0(dw1_local, world_size, rank)
-    dw2_list = _gather_to_rank0(dw2_local, world_size, rank)
-    db1_list = _gather_to_rank0(db1_local, world_size, rank) if db1_local is not None else None
-    db2_list = _gather_to_rank0(db2_local, world_size, rank) if db2_local is not None else None
+    y_full = _all_gather_y(y_local.detach(), world_size, group)
+    dx_full = _all_gather_y(dx_local, world_size, group)
+    dw1_list = _gather_to_rank0(dw1_local, world_size, rank, group)
+    dw2_list = _gather_to_rank0(dw2_local, world_size, rank, group)
+    db1_list = _gather_to_rank0(db1_local, world_size, rank, group) if db1_local is not None else None
+    db2_list = _gather_to_rank0(db2_local, world_size, rank, group) if db2_local is not None else None
 
     if rank == 0:
         # dw1 per rank is (2I, H, E_local) — concat along E_local axis (dim 2)
@@ -557,6 +586,7 @@ def _run_ep_general_one_fwd(
     concat_layout: bool,
     world_size: int,
     rank: int,
+    group: Optional[dist.ProcessGroup] = None,
 ):
     """Run general-routing EP forward in inference mode and return y_full
     on rank 0. Forward-only is enough to exercise the 3×3 dispatch×combine
@@ -572,12 +602,13 @@ def _run_ep_general_one_fwd(
         w2_local,
         b2_local,
         E=E,
+        group=group,
         activation_type=ActivationType.SWIGLU,
         is_inference_mode_enabled=True,
         concat_layout=concat_layout,
         ep_config=cfg,
     )
-    y_full = _all_gather_y(y_local.detach(), world_size)
+    y_full = _all_gather_y(y_local.detach(), world_size, group)
     if rank == 0:
         return y_full
 
@@ -596,6 +627,7 @@ def _run_ep_general_one_train(
     concat_layout: bool,
     world_size: int,
     rank: int,
+    group: Optional[dist.ProcessGroup] = None,
 ):
     """Run one general-routing EP fwd+bwd in training mode; gather per-rank grads to
     rank 0. Returns (y_full, dx_full, ds_full, ep_dw1, ep_dw2, ep_db1, ep_db2) on rank 0,
@@ -616,6 +648,7 @@ def _run_ep_general_one_train(
         w2_t,
         b2_t,
         E=E,
+        group=group,
         activation_type=ActivationType.SWIGLU,
         is_inference_mode_enabled=False,
         concat_layout=concat_layout,
@@ -630,15 +663,15 @@ def _run_ep_general_one_train(
     db1_local = grads[4] if b1_t is not None else None
     db2_local = grads[5] if b1_t is not None else None
 
-    y_full = _all_gather_y(y_local.detach(), world_size)
-    dx_full = _all_gather_y(dx_local, world_size)
+    y_full = _all_gather_y(y_local.detach(), world_size, group)
+    dx_full = _all_gather_y(dx_local, world_size, group)
     # ds is per-token like dx: the backward reduce-scatters it, so each rank's (T_local, K)
     # slice is already complete and needs no cross-rank sum (unlike TC's replicated router_w).
-    ds_full = _all_gather_y(ds_local, world_size)
-    dw1_list = _gather_to_rank0(dw1_local, world_size, rank)
-    dw2_list = _gather_to_rank0(dw2_local, world_size, rank)
-    db1_list = _gather_to_rank0(db1_local, world_size, rank) if db1_local is not None else None
-    db2_list = _gather_to_rank0(db2_local, world_size, rank) if db2_local is not None else None
+    ds_full = _all_gather_y(ds_local, world_size, group)
+    dw1_list = _gather_to_rank0(dw1_local, world_size, rank, group)
+    dw2_list = _gather_to_rank0(dw2_local, world_size, rank, group)
+    db1_list = _gather_to_rank0(db1_local, world_size, rank, group) if db1_local is not None else None
+    db2_list = _gather_to_rank0(db2_local, world_size, rank, group) if db2_local is not None else None
 
     if rank == 0:
         ep_dw1 = torch.cat(dw1_list, dim=2)  # (2I, H, E_local) per rank -> (2I, H, E)
@@ -673,10 +706,12 @@ def _ep_topk_indices_global(
     T_local: int,
     T: int,
     device: torch.device,
+    group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
-    """Run the TC topk on each rank's local logits, all-gather, return the
-    flat (T, K) int64 indices. Used to seed the reference so it picks the
-    same experts that EP's TC topk did (deterministic tie-breaking match)."""
+    """Run the TC topk on each rank's local logits, all-gather (scoped to `group`,
+    None = the default WORLD group), return the flat (T, K) int64 indices. Used to
+    seed the reference so it picks the same experts that EP's TC topk did
+    (deterministic tie-breaking match)."""
     with torch.no_grad():
         logits = F.linear(x_local, router_w)
         _, topk_idx_local = TC_Softmax_Topk_Router_Function.apply(
@@ -690,7 +725,7 @@ def _ep_topk_indices_global(
     dist.all_gather_into_tensor(
         topk_idx_global.view(-1),
         topk_idx_local.view(-1).contiguous(),
-        group=dist.group.WORLD,
+        group=group,
     )
     return topk_idx_global.view(T, K).to(torch.int64)
 
@@ -706,7 +741,16 @@ def _run_one_shape(
     rtol: float,
     seed: int,
     general_preflight: bool = False,
+    only_nccl: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+    group_id: Optional[int] = None,
 ) -> ShapeStats:
+    # All collectives below are scoped to `group` (rank/world_size are already
+    # group-relative) so this same driver also serves an independent EP group
+    # among several siblings under --ep-world-size; None means the default WORLD
+    # group, matching every pre-existing single-group invocation unchanged.
+    src0 = 0 if group is None else dist.get_global_rank(group, 0)
+    mode_pairs = [(DispatchMode.A2A_NCCL, CombineMode.A2A_NCCL)] if only_nccl else DISPATCH_COMBINE_MODE_PAIRS
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
     assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
     assert E % world_size == 0, f"E ({E}) must be divisible by world_size ({world_size})."
@@ -737,7 +781,7 @@ def _run_one_shape(
 
     # Belt-and-suspenders broadcast in case of any non-deterministic init.
     for p in moe.parameters():
-        dist.broadcast(p.data, src=0)
+        dist.broadcast(p.data, src=src0, group=group)
 
     w1_full = moe.c_fc.weight  # (E, 2I, H)
     w2_full = moe.c_proj.weight  # (E, H, I)
@@ -761,7 +805,7 @@ def _run_one_shape(
         x_global = 0.2 * torch.randn(T, H, device=device, dtype=dtype)
     else:
         x_global = torch.empty(T, H, device=device, dtype=dtype)
-    dist.broadcast(x_global, src=0)
+    dist.broadcast(x_global, src=src0, group=group)
     x_local = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
     # dout used for the backward seed — broadcast so every rank has the
@@ -770,7 +814,7 @@ def _run_one_shape(
         dout_global = 0.2 * torch.randn(T, H, device=device, dtype=dtype)
     else:
         dout_global = torch.empty(T, H, device=device, dtype=dtype)
-    dist.broadcast(dout_global, src=0)
+    dist.broadcast(dout_global, src=src0, group=group)
     dout_local = dout_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
     # Pre-broadcast a fixed routing decision used by general_routing_forward.
@@ -782,8 +826,8 @@ def _run_one_shape(
     else:
         scores_g = torch.empty(T, K, device=device, dtype=dtype)
         idx_g = torch.empty(T, K, device=device, dtype=torch.int64)
-    dist.broadcast(scores_g, src=0)
-    dist.broadcast(idx_g, src=0)
+    dist.broadcast(scores_g, src=src0, group=group)
+    dist.broadcast(idx_g, src=src0, group=group)
     scores_local = scores_g[rank * T_local : (rank + 1) * T_local].contiguous()
     idx_local = idx_g[rank * T_local : (rank + 1) * T_local].to(torch.int32).contiguous()
 
@@ -805,6 +849,7 @@ def _run_one_shape(
                 concat_layout,
                 world_size,
                 rank,
+                group,
             )
             if rank == 0:
                 print(f"{tag} PASS — training-mode general routing forward+backward succeeded, no ICE")
@@ -823,7 +868,8 @@ def _run_one_shape(
         b2_local = b2_local_with if use_bias else None
         b1_full = b1_with if use_bias else None
         b2_full = b2_with if use_bias else None
-        log_prefix = f"[W={world_size} {shape.name} bias={int(use_bias)}] "
+        grp_tag = f"grp={group_id} " if group_id is not None else ""
+        log_prefix = f"[{grp_tag}W={world_size} {shape.name} bias={int(use_bias)}] "
 
         # ────────── entry point #1: TC_softmax_topk_forward ──────────
         for variant_name, is_softmax_over_topk, norm_topk_probs in ROUTING_VARIANTS:
@@ -840,6 +886,7 @@ def _run_one_shape(
                 T_local,
                 T,
                 device,
+                group,
             )
             if rank == 0:
                 ref = _per_expert_reference_tc(
@@ -857,62 +904,62 @@ def _run_one_shape(
                 )
                 ref_o, ref_dx, ref_drouter_w, ref_dw1, ref_dw2, ref_db1, ref_db2 = ref
 
-            for dispatch_mode in DISPATCH_MODES:
-                for combine_mode in COMBINE_MODES:
-                    cfg = RuntimeEPConfig(
-                        dispatch_mode=dispatch_mode,
-                        W=world_size,
-                        K=K,
-                        combine_mode=combine_mode,
+            for dispatch_mode, combine_mode in mode_pairs:
+                cfg = RuntimeEPConfig(
+                    dispatch_mode=dispatch_mode,
+                    W=world_size,
+                    K=K,
+                    combine_mode=combine_mode,
+                )
+                tag = f"TC[{variant_name},dispatch={dispatch_mode.value},combine={combine_mode.value}]"
+                try:
+                    result = _run_ep_tc_one(
+                        x_local,
+                        router_w,
+                        w1_local,
+                        w2_local,
+                        b1_local,
+                        b2_local,
+                        dout_local,
+                        K,
+                        E,
+                        cfg,
+                        is_softmax_over_topk,
+                        norm_topk_probs,
+                        concat_layout,
+                        world_size,
+                        rank,
+                        group,
                     )
-                    tag = f"TC[{variant_name},dispatch={dispatch_mode.value},combine={combine_mode.value}]"
-                    try:
-                        result = _run_ep_tc_one(
-                            x_local,
-                            router_w,
-                            w1_local,
-                            w2_local,
-                            b1_local,
-                            b2_local,
-                            dout_local,
-                            K,
-                            E,
-                            cfg,
-                            is_softmax_over_topk,
-                            norm_topk_probs,
-                            concat_layout,
-                            world_size,
-                            rank,
-                        )
-                    except Exception as e:
-                        if rank == 0:
-                            print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
-                            stats.fail_count += 1
-                            stats.failures.append(f"{tag} (exception)")
-                        dist.barrier()
-                        continue
+                except Exception as e:
                     if rank == 0:
-                        y_full, ep_dx, ep_drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
-                        # backward returns expert grads pre-divided by W (see ep.py); the oracle is
-                        # a global sum, so scale it. drouter_w is exempt: already SUM-reduced.
-                        quantities = [
-                            ("o", y_full, ref_o),
-                            ("dx", ep_dx, ref_dx),
-                            ("drouter_w", ep_drouter_w, ref_drouter_w),
-                            ("dw1", ep_dw1, ref_dw1.permute(1, 2, 0) / world_size),  # (2I, H, E)
-                            ("dw2", ep_dw2, ref_dw2.permute(0, 2, 1) / world_size),  # (E, I, H)
-                        ]
-                        if ep_db1 is not None:
-                            quantities.append(("db1", ep_db1, ref_db1 / world_size))
-                            quantities.append(("db2", ep_db2, ref_db2 / world_size))
-                        ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
-                        print(msg)
-                        if ok:
-                            stats.pass_count += 1
-                        else:
-                            stats.fail_count += 1
-                            stats.failures.append(tag)
+                        print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                        stats.fail_count += 1
+                        stats.failures.append(f"{tag} (exception)")
                     dist.barrier()
+                    continue
+                if rank == 0:
+                    y_full, ep_dx, ep_drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
+                    # backward returns expert grads pre-divided by W (see ep.py); the oracle is
+                    # a global sum, so scale it. drouter_w is exempt: already SUM-reduced.
+                    quantities = [
+                        ("o", y_full, ref_o),
+                        ("dx", ep_dx, ref_dx),
+                        ("drouter_w", ep_drouter_w, ref_drouter_w),
+                        ("dw1", ep_dw1, ref_dw1.permute(1, 2, 0) / world_size),  # (2I, H, E)
+                        ("dw2", ep_dw2, ref_dw2.permute(0, 2, 1) / world_size),  # (E, I, H)
+                    ]
+                    if ep_db1 is not None:
+                        quantities.append(("db1", ep_db1, ref_db1 / world_size))
+                        quantities.append(("db2", ep_db2, ref_db2 / world_size))
+                    ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
+                    print(msg)
+                    if ok:
+                        stats.pass_count += 1
+                    else:
+                        stats.fail_count += 1
+                        stats.failures.append(tag)
+                dist.barrier()
 
         # ────────── entry point #2: general_routing_forward ──────────
         if rank == 0:
@@ -930,112 +977,113 @@ def _run_one_shape(
                 )
             )
 
-        for dispatch_mode in DISPATCH_MODES:
-            for combine_mode in COMBINE_MODES:
-                cfg = RuntimeEPConfig(
-                    dispatch_mode=dispatch_mode,
-                    W=world_size,
-                    K=K,
-                    combine_mode=combine_mode,
+        for dispatch_mode, combine_mode in mode_pairs:
+            cfg = RuntimeEPConfig(
+                dispatch_mode=dispatch_mode,
+                W=world_size,
+                K=K,
+                combine_mode=combine_mode,
+            )
+            tag = f"general[dispatch={dispatch_mode.value},combine={combine_mode.value}]"
+            try:
+                y_full = _run_ep_general_one_fwd(
+                    x_local,
+                    idx_local,
+                    scores_local,
+                    w1_local,
+                    w2_local,
+                    b1_local,
+                    b2_local,
+                    E,
+                    cfg,
+                    concat_layout,
+                    world_size,
+                    rank,
+                    group,
                 )
-                tag = f"general[dispatch={dispatch_mode.value},combine={combine_mode.value}]"
-                try:
-                    y_full = _run_ep_general_one_fwd(
-                        x_local,
-                        idx_local,
-                        scores_local,
-                        w1_local,
-                        w2_local,
-                        b1_local,
-                        b2_local,
-                        E,
-                        cfg,
-                        concat_layout,
-                        world_size,
-                        rank,
-                    )
-                except Exception as e:
-                    if rank == 0:
-                        print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
-                        stats.fail_count += 1
-                        stats.failures.append(f"{tag} (exception)")
-                    dist.barrier()
-                    continue
+            except Exception as e:
                 if rank == 0:
-                    quantities = [("o", y_full, ref_o_g)]
-                    ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
-                    print(msg)
-                    if ok:
-                        stats.pass_count += 1
-                    else:
-                        stats.fail_count += 1
-                        stats.failures.append(tag)
+                    print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                    stats.fail_count += 1
+                    stats.failures.append(f"{tag} (exception)")
                 dist.barrier()
+                continue
+            if rank == 0:
+                quantities = [("o", y_full, ref_o_g)]
+                ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
+                print(msg)
+                if ok:
+                    stats.pass_count += 1
+                else:
+                    stats.fail_count += 1
+                    stats.failures.append(tag)
+            dist.barrier()
 
         # ────────── entry point #2b: general_routing_forward in training mode (fwd + bwd) ──────────
-        for dispatch_mode in DISPATCH_MODES:
-            for combine_mode in COMBINE_MODES:
-                cfg = RuntimeEPConfig(
-                    dispatch_mode=dispatch_mode,
-                    W=world_size,
-                    K=K,
-                    combine_mode=combine_mode,
+        for dispatch_mode, combine_mode in mode_pairs:
+            cfg = RuntimeEPConfig(
+                dispatch_mode=dispatch_mode,
+                W=world_size,
+                K=K,
+                combine_mode=combine_mode,
+            )
+            tag = f"general-train[dispatch={dispatch_mode.value},combine={combine_mode.value}]"
+            try:
+                result = _run_ep_general_one_train(
+                    x_local,
+                    idx_local,
+                    scores_local,
+                    w1_local,
+                    w2_local,
+                    b1_local,
+                    b2_local,
+                    dout_local,
+                    E,
+                    cfg,
+                    concat_layout,
+                    world_size,
+                    rank,
+                    group,
                 )
-                tag = f"general-train[dispatch={dispatch_mode.value},combine={combine_mode.value}]"
-                try:
-                    result = _run_ep_general_one_train(
-                        x_local,
-                        idx_local,
-                        scores_local,
-                        w1_local,
-                        w2_local,
-                        b1_local,
-                        b2_local,
-                        dout_local,
-                        E,
-                        cfg,
-                        concat_layout,
-                        world_size,
-                        rank,
-                    )
-                except Exception as e:
-                    if rank == 0:
-                        print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
-                        stats.fail_count += 1
-                        stats.failures.append(f"{tag} (exception)")
-                    dist.barrier()
-                    continue
+            except Exception as e:
                 if rank == 0:
-                    y_full, ep_dx, ep_ds, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
-                    # expert grads come back pre-divided by W (see ep.py); the oracle is a global
-                    # sum, so scale it. o/dx/ds are per-token quantities and need no scaling.
-                    quantities = [
-                        ("o", y_full, ref_o_g),
-                        ("dx", ep_dx, ref_dx_g),
-                        ("ds", ep_ds, ref_ds_g),
-                        ("dw1", ep_dw1, ref_dw1_g.permute(1, 2, 0) / world_size),  # (2I, H, E)
-                        ("dw2", ep_dw2, ref_dw2_g.permute(0, 2, 1) / world_size),  # (E, I, H)
-                    ]
-                    if ep_db1 is not None:
-                        quantities.append(("db1", ep_db1, ref_db1_g / world_size))
-                        quantities.append(("db2", ep_db2, ref_db2_g / world_size))
-                    ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
-                    print(msg)
-                    if ok:
-                        stats.pass_count += 1
-                    else:
-                        stats.fail_count += 1
-                        stats.failures.append(tag)
+                    print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                    stats.fail_count += 1
+                    stats.failures.append(f"{tag} (exception)")
                 dist.barrier()
+                continue
+            if rank == 0:
+                y_full, ep_dx, ep_ds, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
+                # expert grads come back pre-divided by W (see ep.py); the oracle is a global
+                # sum, so scale it. o/dx/ds are per-token quantities and need no scaling.
+                quantities = [
+                    ("o", y_full, ref_o_g),
+                    ("dx", ep_dx, ref_dx_g),
+                    ("ds", ep_ds, ref_ds_g),
+                    ("dw1", ep_dw1, ref_dw1_g.permute(1, 2, 0) / world_size),  # (2I, H, E)
+                    ("dw2", ep_dw2, ref_dw2_g.permute(0, 2, 1) / world_size),  # (E, I, H)
+                ]
+                if ep_db1 is not None:
+                    quantities.append(("db1", ep_db1, ref_db1_g / world_size))
+                    quantities.append(("db2", ep_db2, ref_db2_g / world_size))
+                ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
+                print(msg)
+                if ok:
+                    stats.pass_count += 1
+                else:
+                    stats.fail_count += 1
+                    stats.failures.append(tag)
+            dist.barrier()
         dist.barrier()
 
     return stats
 
 
-def _print_summary(all_stats: List[ShapeStats]) -> bool:
+def _print_summary(all_stats: List[ShapeStats], group_id: Optional[int] = None) -> bool:
     total_pass = sum(s.pass_count for s in all_stats)
     total_fail = sum(s.fail_count for s in all_stats)
-    print("\n=== Summary ===")
+    grp_tag = f" (grp={group_id})" if group_id is not None else ""
+    print(f"\n=== Summary{grp_tag} ===")
     name_w = max((len(s.shape_name) for s in all_stats), default=10)
     for s in all_stats:
         marker = "✓" if s.fail_count == 0 else "✗"
@@ -1064,6 +1112,27 @@ def main() -> int:
         "training mode (K_eq_4 shape, one dispatch/combine pair) and report whether "
         "the QuACK DSL ICE still reproduces. Skips the full sweep.",
     )
+    parser.add_argument(
+        "--only-nccl",
+        action="store_true",
+        help="Restrict the sweep to (A2A_NCCL, A2A_NCCL) only, skipping every symm-mem "
+        "mode pair. Use this for genuine multi-node runs: AG/A2A/RANK_DEDUP dispatch and "
+        "RS/RANK_DEDUP combine are all symm-mem (NVLink P2P) based and are NOT expected to "
+        "work across nodes -- whether they hang or throw a CUDA driver error (observed: "
+        "'invalid resource handle') depends on undecidable-from-here physical NVLink "
+        "topology between whichever nodes SLURM happened to allocate, not on any bug. "
+        "Single-node --standalone runs should omit this flag to keep full sweep coverage.",
+    )
+    parser.add_argument(
+        "--ep-world-size",
+        type=int,
+        default=None,
+        help="Split WORLD_SIZE ranks into WORLD_SIZE/ep-world-size independent EP groups "
+        "of this many ranks each (contiguous rank blocks), to exercise ep < dps "
+        "(fsdp_ep > 1) hybrid topologies. Defaults to WORLD_SIZE (a single group, the "
+        "existing behavior). Implies --only-nccl regardless of that flag's own value, "
+        "since a hybrid group's ranks are placed to be cross-node by construction.",
+    )
     args = parser.parse_args()
 
     if not _under_torchrun():
@@ -1082,6 +1151,11 @@ def main() -> int:
         if rank == 0:
             print(f"SKIP: EP test needs world_size >= 2 (got {world_size}).")
         return 0
+    ep_world_size = args.ep_world_size if args.ep_world_size is not None else world_size
+    assert world_size % ep_world_size == 0, (
+        f"WORLD_SIZE ({world_size}) must be a multiple of --ep-world-size ({ep_world_size})"
+    )
+    only_nccl = args.only_nccl or ep_world_size < world_size
     if local_rank >= torch.cuda.device_count():
         print(
             f"[r{rank}] ERROR: LOCAL_RANK={local_rank} but only " f"{torch.cuda.device_count()} CUDA devices visible",
@@ -1096,17 +1170,40 @@ def main() -> int:
     torch.backends.cudnn.allow_tf32 = False
 
     torch.cuda.set_device(local_rank)
+    # Default NCCL timeout (~10 min) is too tight once W grows: Triton/QuACK
+    # autotune over a new (T, H, I, E, K) shape can cold-compile for minutes,
+    # and with more ranks a single straggler is more likely -- exactly the
+    # class of issue bench-ep-comm.py's own 60-minute override documents.
     dist.init_process_group(
         "nccl",
         rank=rank,
         world_size=world_size,
         device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=datetime.timedelta(minutes=60),
     )
     device = torch.device(f"cuda:{local_rank}")
 
+    # Every rank creates every contiguous-block subgroup, in the same order, and keeps
+    # only the one containing its own global rank -- new_group() requires uniform
+    # participation across the whole world even though only one block's members end up
+    # using each group. A single block (ep_world_size == world_size) reduces to one group
+    # spanning WORLD, i.e. group_id is None and every _run_one_shape call behaves exactly
+    # as before this flag existed.
+    num_groups = world_size // ep_world_size
+    if num_groups > 1:
+        groups = [dist.new_group(ranks=list(range(g * ep_world_size, (g + 1) * ep_world_size))) for g in range(num_groups)]
+        group_id = rank // ep_world_size
+        ep_group = groups[group_id]
+        ep_rank = rank - group_id * ep_world_size
+    else:
+        group_id = None
+        ep_group = None
+        ep_rank = rank
+
     if rank == 0:
         print(
-            f"\nEP correctness test (W={world_size}, "
+            f"\nEP correctness test (W={world_size}, ep_world_size={ep_world_size}, "
+            f"num_ep_groups={num_groups}, "
             f"concat_layout={args.concat_layout}, "
             f"shapes={len(SHAPES)})\n"
             f"per (bias × routing) cell exercises 3 dispatch × 3 combine modes\n"
@@ -1120,8 +1217,8 @@ def main() -> int:
         for shape in shapes:
             try:
                 stats = _run_one_shape(
-                    rank,
-                    world_size,
+                    ep_rank,
+                    ep_world_size,
                     device,
                     shape,
                     dtype=torch.bfloat16,
@@ -1130,9 +1227,12 @@ def main() -> int:
                     rtol=5e-2,
                     seed=1111,
                     general_preflight=args.general_preflight,
+                    only_nccl=only_nccl,
+                    group=ep_group,
+                    group_id=group_id,
                 )
             except Exception as e:
-                if rank == 0:
+                if ep_rank == 0:
                     print(f"[ERR {shape.name}] {e}")
                     traceback.print_exc()
                 stats = ShapeStats(shape.name)
@@ -1141,15 +1241,18 @@ def main() -> int:
             all_stats.append(stats)
             torch.cuda.empty_cache()
     finally:
-        # Decide pass/fail on rank 0, then broadcast so every rank exits the
-        # same way. Without this, rank 0 might exit 1 while peers exit 0 and
-        # torchrun's exit code becomes ambiguous.
-        if rank == 0:
-            success = _print_summary(all_stats)
-            success_t = torch.tensor([1 if success else 0], device=device, dtype=torch.int32)
-        else:
-            success_t = torch.zeros(1, device=device, dtype=torch.int32)
-        dist.broadcast(success_t, src=0)
+        # Each EP group's local rank 0 ("leader") decides its own group's pass/fail (with
+        # num_groups==1 -- the pre-existing single-group case -- there is exactly one
+        # leader, global rank 0, so this reduces to that case exactly). Every rank
+        # contributes a neutral 1 except leaders, who contribute their real verdict; a
+        # world-wide MIN then ANDs every group's result together and delivers it to every
+        # rank, replacing the old rank-0-decides-then-broadcast pattern (which only knew
+        # about a single group) with one that generalizes to any number of them.
+        local_ok = 1
+        if ep_rank == 0:
+            local_ok = 1 if _print_summary(all_stats, group_id) else 0
+        success_t = torch.tensor([local_ok], device=device, dtype=torch.int32)
+        dist.all_reduce(success_t, op=dist.ReduceOp.MIN)
         success = bool(success_t.item())
 
         try:

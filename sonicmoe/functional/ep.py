@@ -25,9 +25,17 @@
 #                             sums are distinct; the win is from skipping
 #                             zero-contribution peers.
 #
-# Mode selection: ``NetworkProfiler`` benchmarks all three dispatch modes
-# and the three combine modes on the local hardware; pass its returned
-# ``RuntimeEPConfig`` via ``ep_config=`` to use the measured winner.
+# A2A_NCCL (dispatch and combine, always used as a pair) — cross-node
+# counterpart, built on plain ``dist.all_to_all_single`` rather than
+# NVLink/symm-mem. Rank-local and undeduped: no global ``topk_idx``
+# all-gather, no dedup packing -- see ``_MoeEPFunctionLocalNCCL`` and
+# ``functional/distributed/ep_nccl/__init__.py``. Never auto-selected by
+# ``NetworkProfiler`` / ``_default_ep_config``; opt-in only, chosen when
+# ``ProcessGroupManager`` detects a cross-node EP topology.
+#
+# Mode selection: ``NetworkProfiler`` benchmarks the three symm-mem dispatch
+# modes and the three symm-mem combine modes on the local hardware; pass its
+# returned ``RuntimeEPConfig`` via ``ep_config=`` to use the measured winner.
 #
 # Naming: T_local tokens/rank, K experts/token, W=ep world size,
 # TK_local=T_local*K, TK_global=W*TK_local, E_local=E//W.
@@ -62,6 +70,8 @@ from ..distributed_utils import (
     _EPWorkspace,
     _is_a2a_combine_mode,
     _is_a2a_dispatch_mode,
+    _is_a2a_nccl_combine_mode,
+    _is_a2a_nccl_dispatch_mode,
     _is_ag_dispatch_mode,
     _is_rank_dedup_combine_mode,
     _is_rank_dedup_dispatch_mode,
@@ -78,9 +88,15 @@ from .distributed import (
     all_gather_triton,
     build_rank_dedup_a_idx,
     compute_dispatch_metadata,
+    compute_local_routing,
+    exchange_split_counts,
+    nccl_a2a,
     rank_dedup_combine_triton,
     rank_dedup_dispatch_triton,
+    reorder_by_send_order,
     rs_combine_triton,
+    scatter_grouped_to_received,
+    unpermute_and_reduce,
 )
 from .metadata import general_routing_router_metadata_triton
 
@@ -550,7 +566,8 @@ class _MoeEPFunction(torch.autograd.Function):
             ctx.scores_global = scores_global
             ctx.set_materialize_grads(False)
 
-        ep_ws.o_hdl.barrier()
+        if ep_ws.o_hdl is not None:
+            ep_ws.o_hdl.barrier()
 
         return o_local
 
@@ -607,7 +624,8 @@ class _MoeEPFunction(torch.autograd.Function):
         else:
             do_buf, do_hdl, do_peer_bufs = ep_ws.x_symm, ep_ws.x_hdl, ep_ws.x_peer_bufs
         do_buf.copy_(dout_local)
-        do_hdl.barrier()
+        if do_hdl is not None:
+            do_hdl.barrier()
 
         if _is_rank_dedup_dispatch_mode(dispatch_mode):
             do_recv_buf = torch.empty(ep_ws.world_size * T_local, H, dtype=dtype, device=device)
@@ -829,7 +847,8 @@ class _MoeEPFunction(torch.autograd.Function):
             tuned=True,
         )
 
-        ep_ws.o_hdl.barrier()
+        if ep_ws.o_hdl is not None:
+            ep_ws.o_hdl.barrier()
 
         ctx.ep_ws = None
         ctx.meta = None
@@ -846,6 +865,386 @@ class _MoeEPFunction(torch.autograd.Function):
             ds_local,
             *([None] * 8),
         )
+
+
+class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
+    """Rank-local, undeduped NCCL EP forward + backward for one MoE layer
+    (``DispatchMode.A2A_NCCL`` / ``CombineMode.A2A_NCCL``).
+
+    Deliberately separate from ``_MoeEPFunction`` rather than another branch
+    threaded into it: that function's callers precompute metadata from a
+    globally-all-gathered ``topk_idx`` *before* calling ``.apply()``, but this
+    path's metadata (what did I receive, from whom) isn't knowable until the
+    a2a transport itself returns -- there's no topology-wide tensor to derive
+    it from up front, that's the point of dropping the global all-gather.
+    So routing, the tiny counts exchange, the X/scores/expert-id transport,
+    the receive-side local metadata, and the GEMMs all happen inside
+    ``forward()`` itself. See ``ep_nccl/__init__.py`` for the dispatch/combine
+    primitives this composes, and ``functional/__init__.py``'s non-EP path for
+    the local histogram+sort pattern the receive-side metadata mirrors.
+
+    Unlike the dedup-based combine, there is no ``local_combine`` kernel here:
+    every (token, expert) slot is transported as its own row (no dedup), so
+    the per-token K-way reduction is a plain local sum after the reverse
+    transport lands data home.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_local: torch.Tensor,
+        w1: torch.Tensor,
+        b1: Optional[torch.Tensor],
+        w2: torch.Tensor,
+        b2: Optional[torch.Tensor],
+        topk_idx_local: torch.Tensor,
+        topk_scores_local: torch.Tensor,
+        cfg: RuntimeEPConfig,
+        group: dist.ProcessGroup,
+        activation_type: ActivationType,
+        is_inference_mode_enabled: bool,
+        concat_layout: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device, x_dtype = x_local.device, x_local.dtype
+        T_local, H = x_local.shape
+        K = topk_idx_local.shape[1]
+        W = dist.get_world_size(group)
+        E_local = cfg.E_local
+        I = cfg.I
+        is_glu_act = cfg.is_glu_act
+        H_act = 2 * I if is_glu_act else I
+        MAX_ROWS_PER_RANK_STATIC = cfg.MAX_ROWS_PER_RANK_STATIC
+
+        # ====================================================================
+        # 1. Local routing + tiny counts exchange -- no global all-gather.
+        # ====================================================================
+        routing = compute_local_routing(topk_idx_local, E_local, W)
+        send_order = routing["send_order"]
+        recv_splits_local = exchange_split_counts(routing["send_splits_local"], group)
+        send_splits = routing["send_splits_local"].tolist()
+        recv_splits = recv_splits_local.tolist()
+        n_recv = sum(recv_splits)
+        # Computed here (not after the metadata call below) because x_recv
+        # needs it immediately: quack's autotuner keys its config cache on
+        # every tensor argument's shape, so x_recv (the up-proj GEMM's own
+        # A) must be a stable, binned shape rather than the raw, routing-
+        # dependent n_recv -- otherwise every call busts the cache and
+        # re-triggers a full autotune sweep. See _binned_max_rows.
+        max_rows = _binned_max_rows(n_recv, cfg)
+
+        # ====================================================================
+        # 2. Dispatch x / scores / local-expert-id. X dominates bytes by
+        #    orders of magnitude, so scores + expert-id stay as their own
+        #    small a2a's rather than being packed into X's payload. Only x
+        #    is padded to max_rows (see above) -- scores/expert-id feed a
+        #    plain, non-autotuned Triton kernel and don't need it.
+        # ====================================================================
+        x_send = reorder_by_send_order(x_local, send_order, K)
+        x_recv = nccl_a2a(x_send, send_splits, recv_splits, group, pad_to=max_rows)
+        scores_send = topk_scores_local.reshape(-1)[send_order]
+        scores_recv = nccl_a2a(scores_send, send_splits, recv_splits, group)
+        expert_id_send = routing["local_expert_flat"][send_order]
+        expert_id_recv = nccl_a2a(expert_id_send, send_splits, recv_splits, group)
+
+        # ====================================================================
+        # 3. Receive-side local metadata -- mirrors the non-EP path's own
+        #    local histogram+sort (functional/__init__.py). No sentinel
+        #    bucket: every received row is a real (token, local-expert) pair
+        #    under undeduped transport, unlike RANK_DEDUP's padding domain.
+        #    x_gather_idx / s_scatter_idx are allocated at the structural
+        #    ceiling and written only at [:n_recv] -- the GEMMs' A_idx needs
+        #    to be exactly ``max_rows``-sized (see step 4), so the tail past
+        #    n_recv is padding, never read since cu_seqlens_m bounds every
+        #    GEMM to [0, n_recv).
+        token_indices = torch.arange(n_recv, dtype=torch.int32, device=device)
+        expert_frequency = torch.empty(E_local, dtype=torch.int32, device=device)
+        expert_frequency_offset = torch.empty(E_local + 1, dtype=torch.int32, device=device)
+        x_gather_idx_full = torch.empty(MAX_ROWS_PER_RANK_STATIC, dtype=torch.int32, device=device)
+        s_scatter_idx_full = torch.empty(MAX_ROWS_PER_RANK_STATIC, dtype=torch.int32, device=device)
+        s_reverse_unused = torch.empty(n_recv, dtype=torch.int32, device=device)
+        general_routing_router_metadata_triton(
+            token_indices,
+            expert_id_recv,
+            n_recv,
+            E_local,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx_full[:n_recv],
+            s_scatter_idx_full[:n_recv],
+            s_reverse_unused,
+            None,
+        )
+
+        x_gather_idx = x_gather_idx_full[:max_rows]
+        # _down_projection_backward_act's gemm_dgated writes ds_scattered at
+        # grouped-row width max_rows (matching dh/a_prime, via A_idx=x_gather_idx's
+        # own length), so s_scatter_idx must be max_rows-wide too -- unlike
+        # x_gather_idx (kernel-internal, cu_seqlens-bounded reads only), the
+        # backward's ``s = topk_scores[s_scatter_idx]`` is a plain eager gather
+        # that touches every position, padding tail included. Route the padding
+        # tail's scatter target at a dedicated overflow slot (index n_recv, one
+        # past the real received-row domain) rather than masking -- see backward's
+        # ds/topk_scores padding, which makes that slot safe on both sides.
+        if max_rows > n_recv:
+            s_scatter_idx_full[n_recv:max_rows] = n_recv
+        s_scatter_idx = s_scatter_idx_full[:max_rows]
+
+        # ====================================================================
+        # 4. Up-proj GEMM with fused gated activation, then down-proj GEMM.
+        # ====================================================================
+        a = torch.empty(max_rows, I, dtype=x_dtype, device=device)
+        h = torch.empty(max_rows, H_act, dtype=x_dtype, device=device)
+        assert activation_type.value in (
+            "swiglu",
+            "geglu",
+        ), f"gemm_gated only supports glu activations, got {activation_type.value}"
+        gemm_gated(
+            x_recv,
+            w1.permute(2, 1, 0),
+            activation=activation_type.value,
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            preact_out=h,
+            postact_out=a,
+            store_preact=(not is_inference_mode_enabled),
+            bias=b1,
+            concat_layout=((("B", "bias") if b1 is not None else ("B",)) if concat_layout else None),
+        )
+        h, a = _scrub(h), _scrub(a)
+        if max_rows > n_recv:
+            h[n_recv:].zero_()
+
+        y = torch.empty(max_rows, H, dtype=x_dtype, device=device)
+        gemm(
+            a,
+            w2,
+            out=y,
+            cu_seqlens_m=expert_frequency_offset,
+            bias=b2,
+            dynamic_scheduler=False,
+        )
+        del a
+
+        # ====================================================================
+        # 5. Combine: un-group y back to received-row order, reverse-transport
+        #    it home (splits swapped -- standard reverse-a2a), un-permute via
+        #    send_order's inverse, weight by score, sum over K. No transport
+        #    of scores needed here: the token owner already has
+        #    topk_scores_local; ``scores_send`` (step 2) is the same
+        #    permutation of it, reused to align with y's reverse-transport
+        #    order before the final un-permute.
+        # ====================================================================
+        y_recv_domain = scatter_grouped_to_received(y, x_gather_idx_full, n_recv)
+        y_back = nccl_a2a(y_recv_domain, recv_splits, send_splits, group)
+        y_back_weighted = y_back.float() * scores_send.float().unsqueeze(-1)
+        o_local = unpermute_and_reduce(y_back_weighted, send_order, T_local, K, reduce=True).to(x_dtype)
+
+        if not is_inference_mode_enabled:
+            ctx.save_for_backward(x_recv, w1, b1, w2, b2, h, scores_recv)
+            ctx.cfg = cfg
+            ctx.group = group
+            ctx.activation_type = activation_type
+            ctx.concat_layout = concat_layout
+            ctx.send_order = send_order
+            ctx.send_splits = send_splits
+            ctx.recv_splits = recv_splits
+            ctx.x_gather_idx_full = x_gather_idx_full
+            ctx.s_scatter_idx = s_scatter_idx
+            ctx.expert_frequency_offset = expert_frequency_offset
+            ctx.n_recv = n_recv
+            ctx.max_rows = max_rows
+            ctx.T_local = T_local
+            ctx.K = K
+            ctx.W = W
+            ctx.set_materialize_grads(False)
+
+        ctx.mark_non_differentiable(expert_frequency)
+        return o_local, expert_frequency
+
+    @staticmethod
+    def backward(ctx, dout_local: torch.Tensor, _grad_expert_frequency):
+        x_recv, w1, b1, w2, b2, h, scores_recv = ctx.saved_tensors
+        cfg: RuntimeEPConfig = ctx.cfg
+        group = ctx.group
+        activation_type = ctx.activation_type
+        concat_layout = ctx.concat_layout
+        send_order = ctx.send_order
+        send_splits = ctx.send_splits
+        recv_splits = ctx.recv_splits
+        x_gather_idx_full = ctx.x_gather_idx_full
+        s_scatter_idx = ctx.s_scatter_idx
+        expert_frequency_offset = ctx.expert_frequency_offset
+        n_recv = ctx.n_recv
+        max_rows = ctx.max_rows
+        T_local = ctx.T_local
+        K = ctx.K
+        W = ctx.W
+        is_glu_act = cfg.is_glu_act
+
+        device, dtype = dout_local.device, dout_local.dtype
+        H = x_recv.shape[1]
+        I = w2.shape[1]
+        x_gather_idx = x_gather_idx_full[:max_rows]
+
+        # ====================================================================
+        # 1. Dispatch dout -- same send_order / splits as forward's X dispatch
+        #    (routing is fixed for the whole fwd+bwd of one step). Padded to
+        #    max_rows for the same reason x_recv is in forward: dout_recv is
+        #    the down-proj-backward-act's own ``dout`` argument, and quack's
+        #    autotuner keys its cache on every tensor argument's shape.
+        # ====================================================================
+        dout_send = reorder_by_send_order(dout_local, send_order, K)
+        dout_recv = nccl_a2a(dout_send, send_splits, recv_splits, group, pad_to=max_rows)
+
+        # ====================================================================
+        # 2. Down-proj backward act (gemm_dgated): dh, ds, a_prime.
+        #    Unchanged kernel, called in its existing non-EP-style unmasked
+        #    mode (dst_rank_flat=None) -- undeduped transport makes the
+        #    grouped-row <-> received-row map a pure permutation, so there
+        #    are no sentinel/peer-owned slots to mask out here. ds and
+        #    topk_scores each get one extra slot at index n_recv (a shared
+        #    overflow target for s_scatter_idx's padding tail, filled in
+        #    forward) -- topk_scores[s_scatter_idx] is a plain eager gather
+        #    over the full max_rows width, so the padding tail must be a
+        #    safe in-bounds read too, not just a safe scatter target.
+        # ====================================================================
+        dh = torch.empty(max_rows, h.shape[1], dtype=h.dtype, device=device)
+        ds = torch.zeros(n_recv + 1, dtype=scores_recv.dtype, device=device)
+        topk_scores_padded = torch.cat([scores_recv, scores_recv.new_zeros(1)])
+        a_prime = torch.empty(max_rows, I, dtype=h.dtype, device=device)
+        db2 = None if b2 is None else torch.empty_like(b2)
+        _down_projection_backward_act(
+            dout=dout_recv,
+            h=h,
+            w2=w2.permute(2, 1, 0),
+            dh=dh,
+            ds=ds,
+            b2=b2,
+            db2=db2,
+            a_prime=a_prime,
+            topk_scores=topk_scores_padded,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+            s_scatter_idx=s_scatter_idx,
+            activation_type=activation_type.value,
+            dst_rank_flat=None,
+            my_rank=0,
+        )
+        ds = ds[:n_recv]
+
+        # ====================================================================
+        # 3. dW2 GEMM.
+        # ====================================================================
+        dw2 = torch.empty_like(w2)
+        gemm(
+            dout_recv.T,
+            a_prime,
+            out=dw2.permute(0, 2, 1),
+            cu_seqlens_k=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            batch_idx_permute=None,
+            dynamic_scheduler=False,
+            tuned=True,
+        )
+        del dout_recv, a_prime, h
+
+        # ====================================================================
+        # 4. Up-proj backward act: dh -> dx_expanded (grouped domain), db1.
+        # ====================================================================
+        dw1 = torch.empty_like(w1)
+        db1 = None if b1 is None else torch.empty_like(b1)
+        dx_expanded = torch.empty(max_rows, H, dtype=dtype, device=device)
+        _up_projection_backward_act(
+            w1=w1,
+            dx_expanded=dx_expanded,
+            dh=dh,
+            db1=db1,
+            expert_frequency_offset=expert_frequency_offset,
+            is_glu_activation=is_glu_act,
+            concat_layout=concat_layout,
+        )
+
+        # ====================================================================
+        # 5. Un-group dx / ds back to received-row order, reverse-transport
+        #    home (splits swapped), un-permute via send_order's inverse.
+        #    ds needs no un-grouping -- _scatter_ds already targeted
+        #    s_scatter_idx, which *is* the received-row index under this
+        #    no-dedup, identity-token-index usage. dx's per-token K-way sum
+        #    happens after the reverse transport lands home, as a plain
+        #    local reduction -- no local_combine kernel, no
+        #    pair_present_mask, since every slot's contribution arrives as
+        #    its own row.
+        # ====================================================================
+        dx_recv_domain = scatter_grouped_to_received(dx_expanded, x_gather_idx_full, n_recv)
+        dx_back = nccl_a2a(dx_recv_domain, recv_splits, send_splits, group)
+        # fp32 accumulation for the K-way sum, matching the symm-mem combine
+        # kernels' register-accumulate-in-fp32 / store-in-model-dtype convention.
+        dx_local = unpermute_and_reduce(dx_back.float(), send_order, T_local, K, reduce=True).to(dtype)
+
+        ds_back = nccl_a2a(ds.unsqueeze(-1), recv_splits, send_splits, group)
+        ds_local = unpermute_and_reduce(ds_back, send_order, T_local, K, reduce=False).view(T_local, K)
+
+        # ====================================================================
+        # 6. dW1 GEMM.
+        # ====================================================================
+        gemm(
+            x_recv.T,
+            dh,
+            out=dw1.permute(2, 1, 0),
+            cu_seqlens_k=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            batch_idx_permute=None,
+            dynamic_scheduler=False,
+            concat_layout=(("out",) if concat_layout else None),
+            tuned=True,
+        )
+
+        # /W to match non-EP after FSDP averages over the W DP ranks; see
+        # _MoeEPFunction's identical comment.
+        return (
+            dx_local,
+            dw1 / W,
+            db1 / W if db1 is not None else None,
+            dw2 / W,
+            db2 / W if db2 is not None else None,
+            None,
+            ds_local,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _moe_ep_forward_nccl_local(
+    x_local: torch.Tensor,
+    topk_idx_local: torch.Tensor,
+    topk_scores_local: torch.Tensor,
+    w1: torch.Tensor,
+    b1: Optional[torch.Tensor],
+    w2: torch.Tensor,
+    b2: Optional[torch.Tensor],
+    cfg: RuntimeEPConfig,
+    group: dist.ProcessGroup,
+    activation_type: ActivationType,
+    is_inference_mode_enabled: bool,
+    concat_layout: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _MoeEPFunctionLocalNCCL.apply(
+        x_local,
+        w1,
+        b1,
+        w2,
+        b2,
+        topk_idx_local,
+        topk_scores_local,
+        cfg,
+        group,
+        activation_type,
+        is_inference_mode_enabled,
+        concat_layout,
+    )
 
 
 def _build_consumer_metadata(
@@ -937,8 +1336,9 @@ def _moe_ep_forward_inner(
     # (s_reverse_local). RANK_DEDUP_DISPATCH_TRITON additionally consumes pair_present_mask
     # / rank_dedup_recv_pos for the canonical-only peer pull.
     recv_pos = metadata["s_reverse_local"] if is_grouped_dispatch else None
-    pair_present_mask = meta.get("pair_present_mask") if _is_rank_dedup_dispatch_mode(dispatch_mode) else None
-    rank_dedup_recv_pos = meta.get("rank_dedup_recv_pos") if _is_rank_dedup_dispatch_mode(dispatch_mode) else None
+    _needs_dedup_dispatch_meta = _is_rank_dedup_dispatch_mode(dispatch_mode)
+    pair_present_mask = meta.get("pair_present_mask") if _needs_dedup_dispatch_meta else None
+    rank_dedup_recv_pos = meta.get("rank_dedup_recv_pos") if _needs_dedup_dispatch_meta else None
 
     # Backward X redispatch always uses AG-CE (independent of forward mode), so dW1 needs an AG-style x_gather_idx.
     # In grouped-dispatch modes (A2A_DISPATCH_TRITON or RANK_DEDUP_DISPATCH_TRITON)
@@ -977,9 +1377,10 @@ def _moe_ep_forward_inner(
     needs_dedup_combine = _is_rank_dedup_combine_mode(combine_mode)
     peer_present_mask = meta.get("peer_present_mask") if needs_dedup_combine else None
 
-    # RANK_DEDUP_DISPATCH_TRITON: build the up-proj A_idx that gathers expert-grouped rows from the packed dispatch buffer.
+    # RANK_DEDUP_DISPATCH_TRITON: build the up-proj A_idx that gathers
+    # expert-grouped rows from the packed dispatch buffer.
     x_idx_expanded_remap_for_rank_dedup: Optional[torch.Tensor] = None
-    if _is_rank_dedup_dispatch_mode(dispatch_mode):
+    if _needs_dedup_dispatch_meta:
         x_idx_expanded_remap_for_rank_dedup = build_rank_dedup_a_idx(
             dst_rank_flat=dst_rank_flat,
             s_reverse_local=metadata["s_reverse_local"],
@@ -1068,6 +1469,12 @@ def _validate_runtime_ep_config(cfg: RuntimeEPConfig, W: int, K: int) -> None:
         )
     if cfg.K != K:
         raise ValueError(f"ep_config.K={cfg.K} does not match the call's K={K}; " "RuntimeEPConfig is per-(W, K).")
+    if _is_a2a_nccl_dispatch_mode(cfg.dispatch_mode) != _is_a2a_nccl_combine_mode(cfg.combine_mode):
+        raise ValueError(
+            f"A2A_NCCL must be used for both dispatch_mode and combine_mode together, got "
+            f"dispatch_mode={cfg.dispatch_mode.value}, combine_mode={cfg.combine_mode.value}: mixing it with a "
+            "symm-mem mode would attempt a symm-mem rendezvous on whichever side isn't NCCL, hanging cross-node."
+        )
 
 
 def _ag_routing_decision(
@@ -1291,11 +1698,31 @@ def moe_ep_TC_softmax_topk_forward(
         MAX_ROWS_PER_RANK_STATIC=T_local * W * min(K, E_local),
     )
 
-    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
-
     topk_scores_l, topk_idx_l, router_logits = _compiled_router_forward(
         x, router_w, W * E_local, K, is_softmax_over_topk, norm_topk_probs
     )
+
+    if _is_a2a_nccl_dispatch_mode(cfg.dispatch_mode):
+        # Rank-local, undeduped path (see _MoeEPFunctionLocalNCCL): no global
+        # topk_idx all-gather, no symm-mem workspace -- routing and transport
+        # both happen inside the autograd Function itself.
+        out, expert_frequency = _moe_ep_forward_nccl_local(
+            x_local=x,
+            topk_idx_local=topk_idx_l,
+            topk_scores_local=topk_scores_l,
+            w1=w1,
+            b1=b1,
+            w2=w2,
+            b2=b2,
+            cfg=cfg,
+            group=mgr.ep_group,
+            activation_type=activation_type,
+            is_inference_mode_enabled=is_inference_mode_enabled,
+            concat_layout=concat_layout,
+        )
+        return out, router_logits, expert_frequency
+
+    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
 
     # Publish x to peers (forward x dispatch in _moe_ep_forward_inner
     # reads peer x_symm), then collect topk_idx across ranks. The no_grad detaches the autograd
@@ -1303,7 +1730,8 @@ def moe_ep_TC_softmax_topk_forward(
     with torch.no_grad():
         ws.x_symm.copy_(x)
     topk_idx_g = _ag_routing_decision(ws, topk_idx_l)
-    ws.x_hdl.barrier()
+    if ws.x_hdl is not None:
+        ws.x_hdl.barrier()
 
     out, expert_frequency = _moe_ep_forward_inner(
         x_local=x,
@@ -1324,6 +1752,7 @@ def moe_ep_TC_softmax_topk_forward(
     return out, router_logits, expert_frequency[:-1]  # drop sentinel count
 
 
+@torch._dynamo.disable
 def moe_ep_general_routing_forward(
     x: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -1379,15 +1808,33 @@ def moe_ep_general_routing_forward(
         MAX_ROWS_PER_RANK_STATIC=T_local * W * min(K, E_local),
     )
 
+    topk_scores = topk_scores.float()  # gemm_dgated's colvec_scale expects fp32
+
+    if _is_a2a_nccl_dispatch_mode(cfg.dispatch_mode):
+        # See moe_ep_TC_softmax_topk_forward's identical branch.
+        return _moe_ep_forward_nccl_local(
+            x_local=x,
+            topk_idx_local=topk_indices.to(torch.int32),
+            topk_scores_local=topk_scores,
+            w1=w1,
+            b1=b1,
+            w2=w2,
+            b2=b2,
+            cfg=cfg,
+            group=mgr.ep_group,
+            activation_type=activation_type,
+            is_inference_mode_enabled=is_inference_mode_enabled,
+            concat_layout=concat_layout,
+        )
+
     ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, cfg.dispatch_mode, layer_id=layer_id)
     # no_grad: see moe_ep_TC_softmax_topk_forward -- keeps x_symm from retaining the graph.
     with torch.no_grad():
         ep_ws.x_symm.copy_(x)
 
-    topk_scores = topk_scores.float()  # gemm_dgated's colvec_scale expects fp32
-
     topk_idx_g = _ag_routing_decision(ep_ws, topk_indices.to(torch.int32))
-    ep_ws.x_hdl.barrier()
+    if ep_ws.x_hdl is not None:
+        ep_ws.x_hdl.barrier()
 
     return _moe_ep_forward_inner(
         x_local=x,

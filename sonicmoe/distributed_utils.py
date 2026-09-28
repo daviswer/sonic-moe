@@ -28,9 +28,11 @@ __all__ = [
     "_is_ag_dispatch_mode",
     "_is_a2a_dispatch_mode",
     "_is_rank_dedup_dispatch_mode",
+    "_is_a2a_nccl_dispatch_mode",
     "_is_a2a_combine_mode",
     "_is_rs_combine_mode",
     "_is_rank_dedup_combine_mode",
+    "_is_a2a_nccl_combine_mode",
     "clear_ep_cache",
 ]
 
@@ -46,6 +48,13 @@ class DispatchMode(str, Enum):
     AG_DISPATCH_TRITON = "AG_DISPATCH_TRITON"
     A2A_DISPATCH_TRITON = "A2A_DISPATCH_TRITON"
     RANK_DEDUP_DISPATCH_TRITON = "RANK_DEDUP_DISPATCH_TRITON"
+    # Rank-local, undeduped dispatch built on plain NCCL all_to_all_single --
+    # viable across nodes, where symm-mem (NVLink/P2P-only) is not. No global
+    # topk_idx all-gather: routing metadata is derived from a tiny (W,)-sized
+    # counts exchange instead. See functional/ep.py's _MoeEPFunctionLocalNCCL
+    # and functional/distributed/ep_nccl/__init__.py. Never selected by
+    # _default_ep_config / NetworkProfiler; opt-in only.
+    A2A_NCCL = "A2A_NCCL"
 
 
 class CombineMode(str, Enum):
@@ -54,6 +63,8 @@ class CombineMode(str, Enum):
     A2A_COMBINE_TRITON = "A2A_COMBINE_TRITON"
     RS_COMBINE_TRITON = "RS_COMBINE_TRITON"
     RANK_DEDUP_COMBINE_TRITON = "RANK_DEDUP_COMBINE_TRITON"
+    # Cross-node counterpart, paired with DispatchMode.A2A_NCCL.
+    A2A_NCCL = "A2A_NCCL"
 
 
 def _is_ag_dispatch_mode(mode: DispatchMode) -> bool:
@@ -68,6 +79,10 @@ def _is_rank_dedup_dispatch_mode(mode: DispatchMode) -> bool:
     return mode == DispatchMode.RANK_DEDUP_DISPATCH_TRITON
 
 
+def _is_a2a_nccl_dispatch_mode(mode: DispatchMode) -> bool:
+    return mode == DispatchMode.A2A_NCCL
+
+
 def _is_a2a_combine_mode(mode: CombineMode) -> bool:
     return mode == CombineMode.A2A_COMBINE_TRITON
 
@@ -78,6 +93,10 @@ def _is_rs_combine_mode(mode: CombineMode) -> bool:
 
 def _is_rank_dedup_combine_mode(mode: CombineMode) -> bool:
     return mode == CombineMode.RANK_DEDUP_COMBINE_TRITON
+
+
+def _is_a2a_nccl_combine_mode(mode: CombineMode) -> bool:
+    return mode == CombineMode.A2A_NCCL
 
 
 # ============================================================================
