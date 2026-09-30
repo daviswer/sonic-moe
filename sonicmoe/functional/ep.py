@@ -43,8 +43,10 @@
 
 from __future__ import annotations
 
+import bisect
 import os
 import time
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -53,12 +55,8 @@ import torch.nn.functional as F
 from quack.gemm_interface import gemm, gemm_gated
 
 # One-time guard for the comprehensive forward+backward kernel warmup
-# (warmup_ep_kernels): QuACK (CUTLASS-DSL) JIT-compiles each gemm kernel the first
-# time it sees a given token-count bucket (~2s on the CPU with the GPU idle).
-# Routing imbalance pushes the runtime row count into new buckets mid-training, so
-# without warmup each new bucket stalls one rank ~2s and the whole EP group waits
-# on it at the next collective. pow2 binning makes the bucket set finite, so we
-# pre-compile every forward AND backward gemm for the occurring buckets up front.
+# (warmup_ep_kernels): pre-tunes every runtime row bin so a new bin never stalls
+# one rank on an autotune benchmark mid-training.
 _EP_WARMED = False
 
 from ..distributed_utils import (
@@ -80,7 +78,7 @@ from ..distributed_utils import (
 )
 from ..enums import ActivationType, is_glu
 from . import TC_Softmax_Topk_Router_Function, _scrub
-from .backward import _down_projection_backward_act, _up_projection_backward_act
+from .backward import _down_projection_backward_act, _token_broadcast_backward, _up_projection_backward_act
 from .distributed import (
     a2a_combine_triton,
     a2a_dispatch_triton,
@@ -90,32 +88,50 @@ from .distributed import (
     compute_dispatch_metadata,
     compute_local_routing,
     exchange_split_counts,
+    gather_grouped_to_received,
     nccl_a2a,
     rank_dedup_combine_triton,
     rank_dedup_dispatch_triton,
     reorder_by_send_order,
     rs_combine_triton,
-    scatter_grouped_to_received,
-    unpermute_and_reduce,
 )
+from .forward import _router_forward as _gather_and_reduce_over_k
 from .metadata import general_routing_router_metadata_triton
 
 
-def _floor_bin_exp(max_rows: int, W: int, K: int, E_local: int) -> int:
-    """Impose a floor on the runtime-row-count bin size (twice uniform expected load)"""
+@lru_cache(maxsize=None)
+def _row_bins(max_rows: int, W: int, K: int, E_local: int) -> Tuple[int, ...]:
+    """Runtime-row-count bins ceil(x*m/4), x = T_local*K (uniform per-rank load), m in {2, 3, 4, 5, 6, 8,
+    12, 16, ...}, capped at max_rows (always the last bin). Worst-case padding from actual is 1.5x."""
     T_local = max_rows // (W * min(K, E_local))
-    uniform = T_local * K  # true per-rank load under uniform routing; == max_rows // W only when E_local >= K
-    return max(min(2 * uniform, max_rows) - 1, 0).bit_length()
+    x = T_local * K
+
+    def ceil_bin(m: int) -> int:
+        return -(-(x * m) // 4)
+
+    multipliers = {5}
+    m4, m3 = 2, 3  # m4: 4*2^j starting at j=-1 (=2); m3: 3*2^j starting at j=0
+    while True:
+        multipliers.add(m4)
+        multipliers.add(m3)
+        if ceil_bin(m4) >= max_rows and ceil_bin(m3) >= max_rows:
+            break
+        m4 *= 2
+        m3 *= 2
+
+    bins = sorted({min(ceil_bin(m), max_rows) for m in multipliers})
+    if bins[-1] != max_rows:
+        bins.append(max_rows)
+
+    return tuple(bins)
 
 
 def _binned_max_rows(actual: int, cfg: RuntimeEPConfig) -> int:
-    """Bin runtime row count to the nearest power of 2 to avoid memory/kernel/tuner
-    thrashing. Lower bound set to twice the expected load under uniform routing,
-    so that it lands almost all the time, forcing near-constant execution patterns."""
-    MAX = cfg.MAX_ROWS_PER_RANK_STATIC
-    floor_bin = 1 << _floor_bin_exp(MAX, cfg.W, cfg.K, cfg.E_local)  # smallest pow2 >= 2x uniform load
-    actual_bin = 1 << max(actual - 1, 0).bit_length()
-    return min(max(actual_bin, floor_bin), MAX)
+    """Bin the runtime row count up to the nearest grid point in _row_bins, to avoid
+    memory/kernel/tuner thrashing while keeping worst-case padding to 1.5x."""
+    bins = _row_bins(cfg.MAX_ROWS_PER_RANK_STATIC, cfg.W, cfg.K, cfg.E_local)
+    idx = bisect.bisect_left(bins, actual)
+    return bins[idx]
 
 
 # Symm mem doesn't play nicely with torch.compile, so we pre-compile
@@ -357,7 +373,7 @@ class _MoeEPFunction(torch.autograd.Function):
         max_rows_per_rank_runtime = MAX_ROWS_PER_RANK_STATIC
         if CPU_sync_on_runtime:
             actual = expert_frequency_offset[E_local].item()
-            # Bin the count to power-of-2 for steady execution and tuning
+            # Bin the count to the grid in _row_bins for steady execution and tuning
             max_rows_per_rank_runtime = _binned_max_rows(actual, cfg)
 
         # ====================================================================
@@ -490,7 +506,7 @@ class _MoeEPFunction(torch.autograd.Function):
 
         h, a = _scrub(h), _scrub(a)
 
-        # gemm_gated only writes h[0:actual] via seqlens; zero the power-of-2
+        # gemm_gated only writes h[0:actual] via seqlens; zero the binned
         # padding tail so gemm_dgated in backward doesn't read garbage.
         if CPU_sync_on_runtime and max_rows_per_rank_runtime > actual:
             h[actual:].zero_()
@@ -540,6 +556,8 @@ class _MoeEPFunction(torch.autograd.Function):
             # h, a are alloc'd fresh at the runtime row count (step 2);
             # cache-path x_compute is alloc'd fresh in step 1; redispatch
             # path saves x_local instead.
+            # saved (not ctx attrs) so checkpointing can free them
+            ctx.meta_keys = tuple(meta.keys())
             ctx.save_for_backward(
                 x_local if redispatch_x_in_backward else x_compute,
                 w1,
@@ -548,22 +566,19 @@ class _MoeEPFunction(torch.autograd.Function):
                 b2,
                 h,
                 topk_scores_local,
+                scores_global,  # RS / RANK_DEDUP score AG, reused in backward
+                *meta.values(),
             )
             ctx.cfg = cfg
-            ctx.meta = meta
             ctx.activation_type = activation_type
             ctx.concat_layout = concat_layout
             ctx.redispatch_x_in_backward = redispatch_x_in_backward
             ctx.CPU_sync_on_runtime = CPU_sync_on_runtime
             ctx.max_rows_per_rank_runtime = max_rows_per_rank_runtime
-            # actual_rows == max_rows when there is no power-of-2 padding;
+            # actual_rows == max_rows when there is no binned padding;
             # sentinel mask in backward can be skipped only in that case.
             ctx.actual_rows = actual if CPU_sync_on_runtime else max_rows_per_rank_runtime
             ctx.ep_ws = ep_ws
-            # Cached AG of topk_scores from the RS- or RANK_DEDUP-combine
-            # forward path; backward step 3 reuses this when present
-            # (avoids a duplicate AG).
-            ctx.scores_global = scores_global
             ctx.set_materialize_grads(False)
 
         if ep_ws.o_hdl is not None:
@@ -582,9 +597,11 @@ class _MoeEPFunction(torch.autograd.Function):
             b2,
             h,
             topk_scores_local,
+            scores_global_cached,
+            *meta_values,
         ) = ctx.saved_tensors
+        meta = dict(zip(ctx.meta_keys, meta_values))
         cfg: RuntimeEPConfig = ctx.cfg
-        meta = ctx.meta
         is_glu_act = cfg.is_glu_act
         K = cfg.K
         W = cfg.W
@@ -672,11 +689,11 @@ class _MoeEPFunction(torch.autograd.Function):
         # 3. All-gather topk scores (or reuse the forward's cached AG)
         # ====================================================================
         # Forward step 4's RS- or RANK_DEDUP-combine path already AGs
-        # scores; if so it cached the result on ``ctx.scores_global``.
+        # scores; if so it saved the result as ``scores_global_cached``.
         # Reuse to avoid a redundant NCCL collective. A2A_COMBINE_TRITON
-        # forward leaves ``ctx.scores_global=None``; we fall back to a fresh AG.
-        if ctx.scores_global is not None:
-            topk_scores_global = ctx.scores_global
+        # forward saves None; we fall back to a fresh AG.
+        if scores_global_cached is not None:
+            topk_scores_global = scores_global_cached
         else:
             topk_scores_global = torch.empty(
                 ep_ws.world_size * T_local * K,
@@ -718,7 +735,7 @@ class _MoeEPFunction(torch.autograd.Function):
         s_scatter_idx_local = s_scatter_idx[:max_rows_per_rank_runtime]
         # ds-scatter sentinel mask: needed whenever s_scatter_idx_local
         # may contain sentinel slots (rows routed to other ranks).
-        # Under CPU_sync_on_runtime with no power-of-2 padding
+        # Under CPU_sync_on_runtime with no binned padding
         # (max_rows == actual_rows), s_scatter_idx_local contains only
         # locally-routed slots so the mask is dead weight — skip it.
         # When binning rounds up past actual_rows, positions
@@ -851,8 +868,6 @@ class _MoeEPFunction(torch.autograd.Function):
             ep_ws.o_hdl.barrier()
 
         ctx.ep_ws = None
-        ctx.meta = None
-        ctx.scores_global = None
 
         # /W to match non-EP after FSDP averages over the W DP ranks; the EP expert mesh is
         # size 1 so FSDP divides by nothing. moe_ep_test.py scales its oracle to match.
@@ -924,6 +939,8 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
         send_splits = routing["send_splits_local"].tolist()
         recv_splits = recv_splits_local.tolist()
         n_recv = sum(recv_splits)
+        n_send = sum(send_splits)
+        send_order = send_order[:n_send]  # drop the tail of dropped (topk_idx < 0) slots
         # Computed here (not after the metadata call below) because x_recv
         # needs it immediately: quack's autotuner keys its config cache on
         # every tensor argument's shape, so x_recv (the up-proj GEMM's own
@@ -941,6 +958,7 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
         # ====================================================================
         x_send = reorder_by_send_order(x_local, send_order, K)
         x_recv = nccl_a2a(x_send, send_splits, recv_splits, group, pad_to=max_rows)
+        del x_send
         scores_send = topk_scores_local.reshape(-1)[send_order]
         scores_recv = nccl_a2a(scores_send, send_splits, recv_splits, group)
         expert_id_send = routing["local_expert_flat"][send_order]
@@ -961,7 +979,8 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
         expert_frequency_offset = torch.empty(E_local + 1, dtype=torch.int32, device=device)
         x_gather_idx_full = torch.empty(MAX_ROWS_PER_RANK_STATIC, dtype=torch.int32, device=device)
         s_scatter_idx_full = torch.empty(MAX_ROWS_PER_RANK_STATIC, dtype=torch.int32, device=device)
-        s_reverse_unused = torch.empty(n_recv, dtype=torch.int32, device=device)
+        # identity token_indices make s_reverse_scatter_idx the inverse of x_gather_idx[:n_recv]
+        recv_to_grouped = torch.empty(n_recv, dtype=torch.int32, device=device)
         general_routing_router_metadata_triton(
             token_indices,
             expert_id_recv,
@@ -971,7 +990,7 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx_full[:n_recv],
             s_scatter_idx_full[:n_recv],
-            s_reverse_unused,
+            recv_to_grouped,
             None,
         )
 
@@ -1027,30 +1046,44 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
 
         # ====================================================================
         # 5. Combine: un-group y back to received-row order, reverse-transport
-        #    it home (splits swapped -- standard reverse-a2a), un-permute via
-        #    send_order's inverse, weight by score, sum over K. No transport
-        #    of scores needed here: the token owner already has
-        #    topk_scores_local; ``scores_send`` (step 2) is the same
-        #    permutation of it, reused to align with y's reverse-transport
-        #    order before the final un-permute.
+        #    it home (splits swapped -- standard reverse-a2a), then fused
+        #    gather+weight+sum over K keyed by ``slot_to_row`` (send_order's inverse).
         # ====================================================================
-        y_recv_domain = scatter_grouped_to_received(y, x_gather_idx_full, n_recv)
-        y_back = nccl_a2a(y_recv_domain, recv_splits, send_splits, group)
-        y_back_weighted = y_back.float() * scores_send.float().unsqueeze(-1)
-        o_local = unpermute_and_reduce(y_back_weighted, send_order, T_local, K, reduce=True).to(x_dtype)
+        y_recv_domain = gather_grouped_to_received(y, recv_to_grouped)
+        del y
+        # one extra zero row at n_send: dropped slots point there and contribute nothing
+        y_back = nccl_a2a(y_recv_domain, recv_splits, send_splits, group, pad_to=n_send + 1)
+        del y_recv_domain
+        y_back[n_send].zero_()
+
+        slot_to_row = torch.full((T_local * K,), n_send, dtype=torch.int32, device=device)
+        slot_to_row[send_order] = torch.arange(n_send, dtype=torch.int32, device=device)
+
+        o_local = torch.empty(T_local, H, dtype=x_dtype, device=device)
+        _gather_and_reduce_over_k(
+            y=y_back,
+            o=o_local,
+            topk_scores=topk_scores_local.reshape(-1),
+            s_reverse_scatter_idx=slot_to_row,
+            num_activated_expert_per_token_offset=None,
+            varlen_K_max=K,
+            H=H,
+            is_varlen_K=False,
+        )
 
         if not is_inference_mode_enabled:
-            ctx.save_for_backward(x_recv, w1, b1, w2, b2, h, scores_recv)
+            # routing tensors are saved (not ctx attrs) so checkpointing can free them
+            ctx.save_for_backward(
+                x_recv, w1, b1, w2, b2, h, scores_recv,
+                send_order, x_gather_idx_full, s_scatter_idx, expert_frequency_offset, slot_to_row, recv_to_grouped,
+            )
             ctx.cfg = cfg
             ctx.group = group
             ctx.activation_type = activation_type
             ctx.concat_layout = concat_layout
-            ctx.send_order = send_order
             ctx.send_splits = send_splits
             ctx.recv_splits = recv_splits
-            ctx.x_gather_idx_full = x_gather_idx_full
-            ctx.s_scatter_idx = s_scatter_idx
-            ctx.expert_frequency_offset = expert_frequency_offset
+            ctx.n_send = n_send
             ctx.n_recv = n_recv
             ctx.max_rows = max_rows
             ctx.T_local = T_local
@@ -1063,17 +1096,17 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout_local: torch.Tensor, _grad_expert_frequency):
-        x_recv, w1, b1, w2, b2, h, scores_recv = ctx.saved_tensors
+        (
+            x_recv, w1, b1, w2, b2, h, scores_recv,
+            send_order, x_gather_idx_full, s_scatter_idx, expert_frequency_offset, slot_to_row, recv_to_grouped,
+        ) = ctx.saved_tensors
         cfg: RuntimeEPConfig = ctx.cfg
         group = ctx.group
         activation_type = ctx.activation_type
         concat_layout = ctx.concat_layout
-        send_order = ctx.send_order
         send_splits = ctx.send_splits
         recv_splits = ctx.recv_splits
-        x_gather_idx_full = ctx.x_gather_idx_full
-        s_scatter_idx = ctx.s_scatter_idx
-        expert_frequency_offset = ctx.expert_frequency_offset
+        n_send = ctx.n_send
         n_recv = ctx.n_recv
         max_rows = ctx.max_rows
         T_local = ctx.T_local
@@ -1095,6 +1128,7 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
         # ====================================================================
         dout_send = reorder_by_send_order(dout_local, send_order, K)
         dout_recv = nccl_a2a(dout_send, send_splits, recv_splits, group, pad_to=max_rows)
+        del dout_send
 
         # ====================================================================
         # 2. Down-proj backward act (gemm_dgated): dh, ds, a_prime.
@@ -1166,23 +1200,25 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
 
         # ====================================================================
         # 5. Un-group dx / ds back to received-row order, reverse-transport
-        #    home (splits swapped), un-permute via send_order's inverse.
-        #    ds needs no un-grouping -- _scatter_ds already targeted
-        #    s_scatter_idx, which *is* the received-row index under this
-        #    no-dedup, identity-token-index usage. dx's per-token K-way sum
-        #    happens after the reverse transport lands home, as a plain
-        #    local reduction -- no local_combine kernel, no
-        #    pair_present_mask, since every slot's contribution arrives as
-        #    its own row.
+        #    home (splits swapped). dx's K-way sum is the fused (fp32-accumulating)
+        #    reduction keyed by ``slot_to_row``. ds needs no un-grouping --
+        #    _scatter_ds already targeted s_scatter_idx, which *is* the
+        #    received-row index under this no-dedup, identity-token-index usage.
         # ====================================================================
-        dx_recv_domain = scatter_grouped_to_received(dx_expanded, x_gather_idx_full, n_recv)
-        dx_back = nccl_a2a(dx_recv_domain, recv_splits, send_splits, group)
-        # fp32 accumulation for the K-way sum, matching the symm-mem combine
-        # kernels' register-accumulate-in-fp32 / store-in-model-dtype convention.
-        dx_local = unpermute_and_reduce(dx_back.float(), send_order, T_local, K, reduce=True).to(dtype)
+        dx_recv_domain = gather_grouped_to_received(dx_expanded, recv_to_grouped)
+        del dx_expanded
+        dx_back = nccl_a2a(dx_recv_domain, recv_splits, send_splits, group, pad_to=n_send + 1)
+        del dx_recv_domain
+        dx_back[n_send].zero_()
+
+        dx_local = torch.empty(T_local, H, dtype=dtype, device=device)
+        _token_broadcast_backward(dx_local, dx_back, slot_to_row, None, K, H, False)
 
         ds_back = nccl_a2a(ds.unsqueeze(-1), recv_splits, send_splits, group)
-        ds_local = unpermute_and_reduce(ds_back, send_order, T_local, K, reduce=False).view(T_local, K)
+        # dropped slots are absent from send_order and keep ds = 0
+        ds_local = torch.zeros(T_local * K, dtype=ds_back.dtype, device=device)
+        ds_local[send_order] = ds_back.view(-1)
+        ds_local = ds_local.view(T_local, K)
 
         # ====================================================================
         # 6. dW1 GEMM.
@@ -1505,16 +1541,18 @@ def warmup_ep_kernels(
     CPU_sync_on_runtime: bool = True,
     ep_config: Optional["RuntimeEPConfig"] = None,
 ) -> None:
-    """One-time: compile every forward AND backward QuACK gemm kernel for the token
-    buckets that occur at runtime, so no CUTLASS-DSL JIT (~2s, GPU idle) ever stalls
-    a rank mid-training.
+    """One-time: pre-populate the autotuned QuACK gemm config for every forward AND
+    backward token bin that occurs at runtime, so no autotune benchmark ever stalls
+    a rank mid-training. The compiles themselves are shape-independent (QuACK's
+    CuTe-DSL compile key has no shape terms), so only the per-bin autotune result is
+    what this warmup buys.
 
     Runs real forward+backward through :func:`moe_ep_general_routing_forward` (which
-    shares ``_MoeEPFunction`` with the TC-softmax path, so the kernels compiled here
+    shares ``_MoeEPFunction`` with the TC-softmax path, so the kernels tuned here
     are exactly the ones training reuses) with synthetic routing that drives
-    ``actual`` (rows landing on local experts) from balanced up to its max, cycled
-    across ep positions so every rank compiles every bucket. Uses detached weight
-    clones, so the warmup's backward never touches the real gradients. 
+    ``actual`` (rows landing on local experts) through every bin in ``_row_bins`` up to
+    2x the uniform load, cycled across ep positions so every rank tunes every bin. Uses detached weight
+    clones, so the warmup's backward never touches the real gradients.
     """
     global _EP_WARMED
     if _EP_WARMED:
@@ -1552,16 +1590,15 @@ def warmup_ep_kernels(
             return idx.to(torch.long)
 
         def _routing(B: int, p: int) -> torch.Tensor:
-            # Drive TARGET rank p to ~B incoming rows (one pow2 bucket): each rank
-            # routes round(B/(W*K)) of its tokens (all K slots) to p's local experts,
-            # while ALL other tokens avoid p's block entirely. p's incoming count is
-            # then ~W*n_hot*K ~= B (not flooded to balanced), so sweeping B over every
-            # pow2 from a starved floor up to MAX lands the target on each bucket
-            # exactly. Cycling p over all W ranks makes every rank compile every
-            # bucket in-process.
+            # Drive TARGET rank p to <=B incoming rows (one bin): each rank routes
+            # floor(B/(W*K)) of its tokens (all K slots) to p's local experts, while
+            # ALL other tokens avoid p's block entirely. p's incoming count is then
+            # W*n_hot*K <= B, landing exactly in bin B since bin spacing (>= x/4) is
+            # much larger than one rank's W*K contribution. Cycling p over all W
+            # ranks makes every rank tune every bin in-process.
             ti = _draw_skip(T_local, p)
             if can_local:
-                n_hot = min(max(round(B / (W * K)), 1), T_local)
+                n_hot = min(max(B // (W * K), 1), T_local)
                 ti[:n_hot] = _draw(n_hot, p * E_local, E_local)
             return ti
 
@@ -1588,22 +1625,27 @@ def warmup_ep_kernels(
             out.float().sum().backward()
 
         npass = 0
-        # Enumerate every pow2 bucket the runtime binning can produce, from the floor
-        # bin up to MAX_ROWS, and compile each on every rank (cycle the target p).
+        # Enumerate every bin the runtime binning can produce, and tune each on
+        # every rank (cycle the target p).
         max_rows = T_local * W * min(K, E_local)  # == MAX_ROWS_PER_RANK_STATIC
-        hi = max_rows.bit_length() - 1
-        lo = _floor_bin_exp(max_rows, W, K, E_local)
-        passes = [(1 << e, p) for e in range(lo, hi + 1) for p in range(W)]
-        for B, p in passes:
-            try:
-                _run(_routing(B, p))
-                npass += 1
-            except Exception as e:
-                if npass <= 1:
-                    log.warning(f"EP warmup pass (B={B}, p={p}) failed: {e!r}")
+        # bins above 2x uniform are rare and their buffers can OOM mid-pass, desyncing the collectives
+        bins = [B for B in _row_bins(max_rows, W, K, E_local) if B <= 2 * T_local * K]
+        passes = [(B, p) for B in bins for p in range(W)]
+        # innermost hooks win: keeps this graph out of an enclosing activation checkpoint's pack/recompute
+        with torch.enable_grad(), torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), lambda t: t):
+            for B, p in passes:
+                try:
+                    _run(_routing(B, p))
+                    npass += 1
+                except Exception as e:
+                    if npass <= 1:
+                        log.warning(f"EP warmup pass (B={B}, p={p}) failed: {e!r}")
         log.info(f"EP fwd+bwd warmup complete: {npass}/{len(passes)} passes (W={W}, E_local={E_local}, T_local={T_local})")
     except Exception as e:
         log.warning(f"EP warmup skipped: {e!r}")
+
+    # the warmup's peak-bin buffers would otherwise stay reserved for the whole run
+    torch.cuda.empty_cache()
 
 
 @torch._dynamo.disable
@@ -1778,6 +1820,10 @@ def moe_ep_general_routing_forward(
     When ``ep_config`` is ``None`` a default is built via
     :func:`_default_ep_config` from the EP world size and the K inferred
     from ``topk_indices.shape[1]``.
+
+    ``topk_indices == -1`` marks a dropped slot (zero output contribution,
+    zero dx/ds). Only the A2A_NCCL modes support this; the symm-mem modes
+    require every index to be a valid expert id.
     """
     K = topk_indices.shape[1]
     mgr = SymmMemManager(group, x.device)
@@ -1790,6 +1836,24 @@ def moe_ep_general_routing_forward(
     _validate_runtime_ep_config(ep_config, W, K)
     activation_type = _normalize_activation(activation_type)
     T_local, d = x.shape
+
+    # first call only; the warmup's own calls re-enter here after _EP_WARMED is set
+    if not _EP_WARMED:
+        warmup_ep_kernels(
+            x,
+            w1,
+            w2,
+            b1,
+            b2,
+            E,
+            K,
+            group=group,
+            layer_id=layer_id,
+            activation_type=activation_type,
+            concat_layout=concat_layout,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
+            ep_config=ep_config,
+        )
 
     # Build the call-local cfg with the layer-static fields filled in;
     # see ``moe_ep_TC_softmax_topk_forward`` for the rationale.

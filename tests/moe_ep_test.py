@@ -185,7 +185,7 @@ from sonicmoe import MoE
 from sonicmoe.distributed_utils import CombineMode, DispatchMode, RuntimeEPConfig  # type: ignore
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function
-from sonicmoe.functional.ep import moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
+from sonicmoe.functional.ep import _row_bins, moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
 
 
 @dataclass
@@ -509,6 +509,7 @@ def _run_ep_tc_one(
     world_size: int,
     rank: int,
     group: Optional[dist.ProcessGroup] = None,
+    CPU_sync_on_runtime: bool = False,
 ):
     """Run one TC EP fwd+bwd; gather per-rank grads to rank 0. Returns the
     (y_full, dx_full, drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2) tuple on
@@ -538,6 +539,7 @@ def _run_ep_tc_one(
         norm_topk_probs=norm_topk_probs,
         concat_layout=concat_layout,
         ep_config=cfg,
+        CPU_sync_on_runtime=CPU_sync_on_runtime,
     )
 
     inputs = [x_t, router_w_t, w1_t, w2_t]
@@ -587,6 +589,7 @@ def _run_ep_general_one_fwd(
     world_size: int,
     rank: int,
     group: Optional[dist.ProcessGroup] = None,
+    CPU_sync_on_runtime: bool = False,
 ):
     """Run general-routing EP forward in inference mode and return y_full
     on rank 0. Forward-only is enough to exercise the 3×3 dispatch×combine
@@ -607,6 +610,7 @@ def _run_ep_general_one_fwd(
         is_inference_mode_enabled=True,
         concat_layout=concat_layout,
         ep_config=cfg,
+        CPU_sync_on_runtime=CPU_sync_on_runtime,
     )
     y_full = _all_gather_y(y_local.detach(), world_size, group)
     if rank == 0:
@@ -628,6 +632,7 @@ def _run_ep_general_one_train(
     world_size: int,
     rank: int,
     group: Optional[dist.ProcessGroup] = None,
+    CPU_sync_on_runtime: bool = False,
 ):
     """Run one general-routing EP fwd+bwd in training mode; gather per-rank grads to
     rank 0. Returns (y_full, dx_full, ds_full, ep_dw1, ep_dw2, ep_db1, ep_db2) on rank 0,
@@ -653,6 +658,7 @@ def _run_ep_general_one_train(
         is_inference_mode_enabled=False,
         concat_layout=concat_layout,
         ep_config=cfg,
+        CPU_sync_on_runtime=CPU_sync_on_runtime,
     )
     inputs = [x_t, scores_t, w1_t, w2_t]
     if b1_t is not None:
@@ -744,6 +750,7 @@ def _run_one_shape(
     only_nccl: bool = False,
     group: Optional[dist.ProcessGroup] = None,
     group_id: Optional[int] = None,
+    cpu_sync_on_runtime: bool = False,
 ) -> ShapeStats:
     # All collectives below are scoped to `group` (rank/world_size are already
     # group-relative) so this same driver also serves an independent EP group
@@ -850,6 +857,7 @@ def _run_one_shape(
                 world_size,
                 rank,
                 group,
+                CPU_sync_on_runtime=cpu_sync_on_runtime,
             )
             if rank == 0:
                 print(f"{tag} PASS — training-mode general routing forward+backward succeeded, no ICE")
@@ -930,6 +938,7 @@ def _run_one_shape(
                         world_size,
                         rank,
                         group,
+                        CPU_sync_on_runtime=cpu_sync_on_runtime,
                     )
                 except Exception as e:
                     if rank == 0:
@@ -1000,6 +1009,7 @@ def _run_one_shape(
                     world_size,
                     rank,
                     group,
+                    CPU_sync_on_runtime=cpu_sync_on_runtime,
                 )
             except Exception as e:
                 if rank == 0:
@@ -1044,6 +1054,7 @@ def _run_one_shape(
                     world_size,
                     rank,
                     group,
+                    CPU_sync_on_runtime=cpu_sync_on_runtime,
                 )
             except Exception as e:
                 if rank == 0:
@@ -1074,9 +1085,97 @@ def _run_one_shape(
                     stats.fail_count += 1
                     stats.failures.append(tag)
             dist.barrier()
+
+        # ────────── entry point #2c: general-train with dropped (-1) slots, A2A_NCCL only ──────────
+        nccl_cfg = RuntimeEPConfig(
+            dispatch_mode=DispatchMode.A2A_NCCL, W=world_size, K=K, combine_mode=CombineMode.A2A_NCCL
+        )
+        drop_routings = [
+            ("rand10", partial(_random_drop_routing, idx_g, seed)),
+            ("hot-cap1", partial(_hot_capped_routing, scores_g, T_local, E, world_size)),
+        ]
+        for drop_name, build_routing in drop_routings:
+            tag = f"general-train-drop[{drop_name},dispatch=a2a_nccl,combine=a2a_nccl]"
+            try:
+                idx_d = build_routing()
+                result = _run_ep_general_one_train(
+                    x_local,
+                    idx_d[rank * T_local : (rank + 1) * T_local].to(torch.int32).contiguous(),
+                    scores_local,
+                    w1_local,
+                    w2_local,
+                    b1_local,
+                    b2_local,
+                    dout_local,
+                    E,
+                    nccl_cfg,
+                    concat_layout,
+                    world_size,
+                    rank,
+                    group,
+                    CPU_sync_on_runtime=cpu_sync_on_runtime,
+                )
+            except Exception as e:
+                if rank == 0:
+                    print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                    stats.fail_count += 1
+                    stats.failures.append(f"{tag} (exception)")
+                dist.barrier()
+                continue
+            if rank == 0:
+                # the oracle's per-expert match never selects -1, so dropped slots add nothing and get ds = 0
+                ref_o_d, ref_dx_d, ref_ds_d, ref_dw1_d, ref_dw2_d, ref_db1_d, ref_db2_d = (
+                    _per_expert_reference_general(
+                        x_global, w1_full, w2_full, b1_full, b2_full, idx_d, scores_g, concat_layout, dout_global
+                    )
+                )
+                y_full, ep_dx, ep_ds, ep_dw1, ep_dw2, ep_db1, ep_db2 = result
+                quantities = [
+                    ("o", y_full, ref_o_d),
+                    ("dx", ep_dx, ref_dx_d),
+                    ("ds", ep_ds, ref_ds_d),
+                    ("dw1", ep_dw1, ref_dw1_d.permute(1, 2, 0) / world_size),
+                    ("dw2", ep_dw2, ref_dw2_d.permute(0, 2, 1) / world_size),
+                ]
+                if ep_db1 is not None:
+                    quantities.append(("db1", ep_db1, ref_db1_d / world_size))
+                    quantities.append(("db2", ep_db2, ref_db2_d / world_size))
+                ok, msg = _check_quantities(tag, log_prefix, quantities, atol, rtol)
+                print(msg)
+                if ok:
+                    stats.pass_count += 1
+                else:
+                    stats.fail_count += 1
+                    stats.failures.append(tag)
+            dist.barrier()
         dist.barrier()
 
     return stats
+
+
+def _random_drop_routing(idx_g: torch.Tensor, seed: int) -> torch.Tensor:
+    """~10% of slots set to -1; CPU-seeded so every rank builds the same routing without a broadcast."""
+    drop = torch.rand(idx_g.shape, generator=torch.Generator().manual_seed(seed)) < 0.1
+    return torch.where(drop.to(idx_g.device), -1, idx_g)
+
+
+def _hot_capped_routing(scores_g: torch.Tensor, T_local: int, E: int, world_size: int) -> torch.Tensor:
+    """Every token routes to experts 0..K-1 (all on the lowest ranks), then each source rank keeps its
+    highest-scored ceil(T_local*K/W) slots per destination rank, so the truncation binds end to end."""
+    T, K = scores_g.shape
+    E_local = E // world_size
+    capacity = -(-T_local * K // world_size)
+    capped = torch.arange(K, device=scores_g.device).expand(T, K).contiguous()
+    dst = capped // E_local
+    for r in range(world_size):
+        rows = slice(r * T_local, (r + 1) * T_local)
+        flat_dst, flat_scores, flat_out = dst[rows].flatten(), scores_g[rows].flatten(), capped[rows].view(-1)
+        for d in range(world_size):
+            slots = (flat_dst == d).nonzero().flatten()
+            order = flat_scores[slots].argsort(descending=True, stable=True)
+            flat_out[slots[order[capacity:]]] = -1
+    assert (capped < 0).any(), "hot routing should exceed the capacity cap"
+    return capped
 
 
 def _print_summary(all_stats: List[ShapeStats], group_id: Optional[int] = None) -> bool:
@@ -1096,6 +1195,18 @@ def _print_summary(all_stats: List[ShapeStats], group_id: Optional[int] = None) 
 
 def _under_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def _check_row_bins() -> bool:
+    """Pure-Python sanity check for ep._row_bins's grid on a known shape: no
+    GPU/dist needed, so this always runs, even without torchrun."""
+    max_rows = 8192 * 4 * 4  # T_local=8192, K=4, W=4, E_local=12 -> x = T_local*K = 32768
+    expected = (16384, 24576, 32768, 40960, 49152, 65536, 98304, 131072)
+    actual = _row_bins(max_rows, W=4, K=4, E_local=12)
+    ok = actual == expected
+    if not ok:
+        print(f"_row_bins MISMATCH: expected {expected}, got {actual}", file=sys.stderr)
+    return ok
 
 
 def main() -> int:
@@ -1133,7 +1244,17 @@ def main() -> int:
         "existing behavior). Implies --only-nccl regardless of that flag's own value, "
         "since a hybrid group's ranks are placed to be cross-node by construction.",
     )
+    parser.add_argument(
+        "--cpu-sync-on-runtime",
+        action="store_true",
+        help="Pass CPU_sync_on_runtime=True to both entry points, exercising the symm "
+        "path's binned max_rows_per_rank_runtime branch (lm-engine's production setting; "
+        "otherwise untested here). The NCCL path always bins regardless of this flag.",
+    )
     args = parser.parse_args()
+
+    if not _check_row_bins():
+        return 2
 
     if not _under_torchrun():
         print(
@@ -1230,6 +1351,7 @@ def main() -> int:
                     only_nccl=only_nccl,
                     group=ep_group,
                     group_id=group_id,
+                    cpu_sync_on_runtime=args.cpu_sync_on_runtime,
                 )
             except Exception as e:
                 if ep_rank == 0:

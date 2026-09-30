@@ -39,22 +39,26 @@ def compute_local_routing(topk_idx_local: torch.Tensor, E_local: int, W: int) ->
         topk_idx_local: (T_local, K) int -- global expert ids picked by this
             rank's own tokens. Global id ``e`` maps to destination rank
             ``e // E_local`` and local expert ``e % E_local`` (block layout,
-            matching ``compute_dispatch_metadata``'s convention).
+            matching ``compute_dispatch_metadata``'s convention). A negative
+            id marks a dropped slot, which is never sent.
         E_local: experts per rank.
         W: EP world size.
 
     Returns a dict with:
-        dst_rank_flat: (TK_local,) int32 -- destination rank per slot.
+        dst_rank_flat: (TK_local,) int32 -- destination rank per slot (W for
+            dropped slots).
         local_expert_flat: (TK_local,) int32 -- local expert id per slot.
         send_order: (TK_local,) int64 -- permutation of slot indices, stable-
-            sorted by destination rank.
+            sorted by destination rank; dropped slots sort last, past
+            ``sum(send_splits_local)``.
         send_splits_local: (W,) int32 -- per-destination outgoing slot count.
     """
     flat = topk_idx_local.reshape(-1).to(torch.int64)
-    dst_rank_flat = torch.div(flat, E_local, rounding_mode="floor").to(torch.int32)
-    local_expert_flat = (flat - dst_rank_flat.to(torch.int64) * E_local).to(torch.int32)
+    valid = flat >= 0
+    dst_rank_flat = torch.where(valid, torch.div(flat, E_local, rounding_mode="floor"), W).to(torch.int32)
+    local_expert_flat = torch.where(valid, flat - dst_rank_flat.to(torch.int64) * E_local, 0).to(torch.int32)
     send_order = torch.argsort(dst_rank_flat, stable=True)
-    send_splits_local = torch.bincount(dst_rank_flat, minlength=W).to(torch.int32)
+    send_splits_local = torch.bincount(dst_rank_flat, minlength=W + 1)[:W].to(torch.int32)
     return {
         "dst_rank_flat": dst_rank_flat,
         "local_expert_flat": local_expert_flat,
@@ -114,33 +118,9 @@ def reorder_by_send_order(x_local: torch.Tensor, send_order: torch.Tensor, K: in
     return x_local.index_select(0, send_token_idx)
 
 
-def unpermute_and_reduce(
-    received: torch.Tensor,
-    send_order: torch.Tensor,
-    T_local: int,
-    K: int,
-    reduce: bool,
-) -> torch.Tensor:
-    """Reverse-combine's final local step: un-permute the reverse-transported
-    (TK_local, ...) buffer back into original (t, k) slot order via
-    ``send_order``'s inverse, then optionally sum over K (dx) or just reshape
-    (ds)."""
-    trailing = received.shape[1:]
-    buf = torch.empty((T_local * K,) + trailing, dtype=received.dtype, device=received.device)
-    buf[send_order] = received
-    buf = buf.view((T_local, K) + trailing)
-    return buf.sum(dim=1) if reduce else buf
-
-
-def scatter_grouped_to_received(
-    grouped: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    n_recv: int,
-) -> torch.Tensor:
-    """Un-group a (n_recv, ...) grouped-by-expert buffer back into received-row
-    order. ``x_gather_idx[:n_recv]`` is a permutation under undeduped transport
-    (bijection grouped-position -> received-row-index), so this scatter is
-    total and well-defined."""
-    out = torch.empty((n_recv,) + tuple(grouped.shape[1:]), dtype=grouped.dtype, device=grouped.device)
-    out[x_gather_idx[:n_recv].to(torch.int64)] = grouped[:n_recv]
-    return out
+def gather_grouped_to_received(grouped: torch.Tensor, recv_to_grouped: torch.Tensor) -> torch.Tensor:
+    """Un-group a grouped-by-expert buffer back into received-row order.
+    ``recv_to_grouped`` (length n_recv) is the inverse of ``x_gather_idx[:n_recv]``,
+    a permutation under undeduped transport; a row gather is much faster than
+    the equivalent index_put scatter."""
+    return grouped.index_select(0, recv_to_grouped)

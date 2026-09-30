@@ -7,9 +7,8 @@ from .ep_dispatch import a2a_dispatch_triton, build_rank_dedup_a_idx, rank_dedup
 from .ep_nccl import (
     compute_local_routing,
     exchange_split_counts,
+    gather_grouped_to_received,
     nccl_a2a,
     reorder_by_send_order,
-    scatter_grouped_to_received,
-    unpermute_and_reduce,
 )
 from .metadata import compute_dispatch_metadata

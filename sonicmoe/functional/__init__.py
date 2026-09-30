@@ -4,6 +4,8 @@
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 
 from ..enums import ActivationType, is_glu
@@ -19,10 +21,32 @@ from .metadata import TC_topk_router_metadata_triton, general_routing_router_met
 
 # gemm_gated intermittently returns |values| ~1e28 where the real range is O(10)
 _MAX_ABS = 200.0
+_SCRUB_BLOCK = 1024
+
+
+@triton.jit
+def _scrub_kernel(t_ptr, n_elements, max_abs, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offsets < n_elements
+
+    v_f32 = tl.load(t_ptr + offsets, mask=mask).to(tl.float32)
+    is_bad = (v_f32 != v_f32) | (tl.abs(v_f32) > max_abs)
+    v_f32 = tl.where(is_bad, 0.0, v_f32)
+
+    tl.store(t_ptr + offsets, v_f32.to(t_ptr.dtype.element_ty), mask=mask)
 
 
 def _scrub(t: torch.Tensor | None) -> torch.Tensor | None:
-    return None if t is None else t.masked_fill(~torch.isfinite(t) | (t.abs() > _MAX_ABS), 0.0)
+    if t is None:
+        return None
+
+    assert t.is_contiguous()
+    n_elements = t.numel()
+    grid = (triton.cdiv(n_elements, _SCRUB_BLOCK),)
+    _scrub_kernel[grid](t, n_elements, _MAX_ABS, BLOCK=_SCRUB_BLOCK)
+
+    return t
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
