@@ -77,7 +77,7 @@ from ..distributed_utils import (
     clear_ep_cache,
 )
 from ..enums import ActivationType, is_glu
-from . import TC_Softmax_Topk_Router_Function, _scrub
+from . import TC_Softmax_Topk_Router_Function
 from .backward import _down_projection_backward_act, _token_broadcast_backward, _up_projection_backward_act
 from .distributed import (
     a2a_combine_triton,
@@ -503,8 +503,6 @@ class _MoeEPFunction(torch.autograd.Function):
             bias=b1,
             concat_layout=((("B", "bias") if b1 is not None else ("B",)) if concat_layout else None),
         )
-
-        h, a = _scrub(h), _scrub(a)
 
         # gemm_gated only writes h[0:actual] via seqlens; zero the binned
         # padding tail so gemm_dgated in backward doesn't read garbage.
@@ -1029,7 +1027,6 @@ class _MoeEPFunctionLocalNCCL(torch.autograd.Function):
             bias=b1,
             concat_layout=((("B", "bias") if b1 is not None else ("B",)) if concat_layout else None),
         )
-        h, a = _scrub(h), _scrub(a)
         if max_rows > n_recv:
             h[n_recv:].zero_()
 

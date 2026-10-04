@@ -4,8 +4,8 @@
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+from quack import gemm_interface
+from quack.autotuner import Autotuner
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 
 from ..enums import ActivationType, is_glu
@@ -19,34 +19,29 @@ from .forward import _router_forward, _topk_softmax_fwd
 from .metadata import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
-# gemm_gated intermittently returns |values| ~1e28 where the real range is O(10)
-_MAX_ABS = 200.0
-_SCRUB_BLOCK = 1024
+def _restrict_sm100_gemm_configs() -> None:
+    # 2-CTA (cluster_m=2) SM100 GEMMs intermittently deadlock in the TMEM dealloc handshake
+    for autotuner in vars(gemm_interface).values():
+        if not isinstance(autotuner, Autotuner):
+            continue
+
+        autotuner.configs = [
+            c
+            for c in autotuner.configs
+            if (config := c.kwargs.get("config")) is None
+            or config.device_capacity not in (10, 11)
+            or config.cluster_m == 1
+        ]
 
 
-@triton.jit
-def _scrub_kernel(t_ptr, n_elements, max_abs, BLOCK: tl.constexpr):
-    pid = tl.program_id(axis=0).to(tl.int64)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-    mask = offsets < n_elements
-
-    v_f32 = tl.load(t_ptr + offsets, mask=mask).to(tl.float32)
-    is_bad = (v_f32 != v_f32) | (tl.abs(v_f32) > max_abs)
-    v_f32 = tl.where(is_bad, 0.0, v_f32)
-
-    tl.store(t_ptr + offsets, v_f32.to(t_ptr.dtype.element_ty), mask=mask)
+_restrict_sm100_gemm_configs()
 
 
-def _scrub(t: torch.Tensor | None) -> torch.Tensor | None:
-    if t is None:
-        return None
-
-    assert t.is_contiguous()
-    n_elements = t.numel()
-    grid = (triton.cdiv(n_elements, _SCRUB_BLOCK),)
-    _scrub_kernel[grid](t, n_elements, _MAX_ABS, BLOCK=_SCRUB_BLOCK)
-
-    return t
+@torch.compiler.disable
+def _host_sync() -> None:
+    # non-EP MoE otherwise lets the host run ahead into a rare backward GPU hang on SM100;
+    # EP already syncs every layer
+    torch.cuda.current_stream().synchronize()
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -151,8 +146,6 @@ class _UpProjection(torch.autograd.Function):
             bias=b1,
             concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
         )
-
-        h, a = _scrub(h), _scrub(a)
 
         ctx.T = T
         ctx.TK = TK
@@ -283,6 +276,7 @@ class _DownProjection(torch.autograd.Function):
             H=H,
             is_varlen_K=is_varlen_K,
         )
+        _host_sync()
 
         ctx.T = T
         ctx.K = K
@@ -303,6 +297,8 @@ class _DownProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
+        _host_sync()
+
         T = ctx.T
         K = ctx.K
         is_varlen_K = ctx.is_varlen_K

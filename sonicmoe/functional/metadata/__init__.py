@@ -21,7 +21,6 @@ def _compute_col_partial_sum_kernel(
     TOKENS_PER_TILE: tl.constexpr,
     K_POW2: tl.constexpr,  # next_power_of_2(K),
     K: tl.constexpr,  # actual number of experts per token
-    E_POW2: tl.constexpr,  # next_power_of_2(E)
 ):
     # One CTA per tile. Tile `t` covers tokens [t * TOKENS_PER_TILE, (t+1) * TOKENS_PER_TILE).
     # Produces partial_sum[e, tile_id] = number of entries in this tile routed to expert e.
@@ -29,15 +28,7 @@ def _compute_col_partial_sum_kernel(
     # Caller transposes to [n_tiles, E] before passing to stage1/stage2.
     tile_id = tl.program_id(0)
 
-    # Zero this tile's column in partial_sum[*, tile_id].
-    # Chunked by E_POW2 to keep vector width a power of 2.
-    for e_start in tl.static_range(0, E, E_POW2):
-        e_offs = e_start + tl.arange(0, E_POW2)
-        tl.store(
-            partial_sum_ptr + e_offs * n_tiles + tile_id,
-            tl.zeros([E_POW2], tl.int32),
-            mask=e_offs < E,
-        )
+    # partial_sum is zero-initialized by the caller: zeroing here would race the atomics below across warps
 
     # Load expert ids for this tile: shape [TOKENS_PER_TILE, K_POW2].
     # Tokens beyond T and k-slots beyond K are masked out (other=-1).
@@ -97,7 +88,7 @@ def TC_topk_router_metadata_triton(
     # col_partial_sum_trans[E, n_tiles]: raw per-expert-per-tile counts.
     # Stored transposed so each CTA writes to its own column (tile_id), avoiding
     # cross-CTA write conflicts. Transposed back to [n_tiles, E] for stage1/stage2.
-    col_partial_sum_trans = torch.empty(E, n_tiles, dtype=torch.int32, device=device)
+    col_partial_sum_trans = torch.zeros(E, n_tiles, dtype=torch.int32, device=device)
     _compute_col_partial_sum_kernel[(n_tiles,)](
         topk_router_indices,
         col_partial_sum_trans,
@@ -107,7 +98,6 @@ def TC_topk_router_metadata_triton(
         TOKENS_PER_TILE=TOKENS_PER_BLOCK,
         K_POW2=K_POW2,
         K=K,
-        E_POW2=E_POW2,
     )
 
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
@@ -156,18 +146,10 @@ def _general_compute_col_partial_sum_kernel(
     E: tl.constexpr,
     n_tiles,
     BLOCK_SIZE: tl.constexpr,
-    E_POW2: tl.constexpr,
 ):
     tile_id = tl.program_id(0)
 
-    # Zero this tile's column in partial_sum[*, tile_id].
-    for e_start in tl.static_range(0, E, E_POW2):
-        e_offs = e_start + tl.arange(0, E_POW2)
-        tl.store(
-            partial_sum_ptr + e_offs * n_tiles + tile_id,
-            tl.zeros([E_POW2], tl.int32),
-            mask=e_offs < E,
-        )
+    # partial_sum is zero-initialized by the caller: zeroing here would race the atomics below across warps
 
     # Load expert ids for this tile (flat indexing into selected_E).
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -307,7 +289,7 @@ def general_routing_router_metadata_triton(
     n_tiles = triton.cdiv(TK, BLOCK_SIZE)
 
     # ── Kernel 1: tiled histogram ─────────────────────────────────────────
-    col_partial_sum_trans = torch.empty(E, n_tiles, dtype=torch.int32, device=device)
+    col_partial_sum_trans = torch.zeros(E, n_tiles, dtype=torch.int32, device=device)
     _general_compute_col_partial_sum_kernel[(n_tiles,)](
         selected_E,
         col_partial_sum_trans,
@@ -315,7 +297,6 @@ def general_routing_router_metadata_triton(
         E,
         n_tiles,
         BLOCK_SIZE=BLOCK_SIZE,
-        E_POW2=E_POW2,
     )
 
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
